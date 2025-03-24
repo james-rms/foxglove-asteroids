@@ -2,8 +2,6 @@ import { Immutable, MessageEvent, PanelExtensionContext, Topic } from "@foxglove
 import React, { ReactElement, useEffect, useLayoutEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
-const PLAYER = "james";
-
 type PressedKeys = {
   a: boolean;
   w: boolean;
@@ -22,7 +20,7 @@ function toBitmap(pressedKeys: PressedKeys): number {
   );
 }
 
-function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactElement {
+function KeyListenPanel({ context }: { context: PanelExtensionContext }): ReactElement {
   const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
   const [messages, setMessages] = useState<undefined | Immutable<MessageEvent[]>>();
   const [pressedKeys, setPressedKeys] = useState<PressedKeys>({
@@ -33,8 +31,6 @@ function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactEle
     " ": false,
   });
   const [canPublish, setCanPublish] = useState<boolean | undefined>(undefined);
-
-  const keyPublishTopic = `/keys/${PLAYER}`;
 
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
 
@@ -77,12 +73,13 @@ function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactEle
     // Once you subscribe to topics, currentFrame will contain message events from those topics (assuming there are messages).
     context.subscribe([{ topic: "/server-pulse" }]);
     if (context.advertise) {
-      context.advertise(keyPublishTopic, "std_msgs/Int");
+      context.advertise("/keys", "number");
+      context.advertise("/my-name-is", "string");
       setCanPublish(true);
     } else {
       setCanPublish(false);
     }
-  }, [context, keyPublishTopic]);
+  }, [context]);
 
   // Set up keyboard event listeners
   useEffect(() => {
@@ -112,10 +109,9 @@ function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactEle
   useEffect(() => {
     if (canPublish != undefined && canPublish) {
       const bitmap = toBitmap(pressedKeys);
-      console.log(`published ${bitmap} to ${keyPublishTopic}`);
-      context.publish!(keyPublishTopic, bitmap);
+      context.publish!("/keys", bitmap);
     }
-  }, [canPublish, pressedKeys, keyPublishTopic, context]);
+  }, [canPublish, pressedKeys, context]);
 
   // invoke the done callback once the render is complete
   useEffect(() => {
@@ -174,7 +170,7 @@ function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactEle
 
 export function initExamplePanel(context: PanelExtensionContext): () => void {
   const root = createRoot(context.panelElement);
-  root.render(<ExamplePanel context={context} />);
+  root.render(<KeyListenPanel context={context} />);
 
   // Return a function to run when the panel is removed
   return () => {
