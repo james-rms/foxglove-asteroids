@@ -4,10 +4,12 @@ use std::{
     time::Duration,
 };
 
+use rapier2d::prelude::*;
+
 use foxglove::{
     schemas::{
         ArrowPrimitive, Color, FrameTransform, FrameTransforms, Quaternion, SceneEntity,
-        SceneUpdate, Timestamp, Vector3,
+        SceneUpdate, Vector3,
     },
     websocket::{Capability, ClientId},
 };
@@ -33,6 +35,16 @@ struct AsteroidClient {
 #[derive(Default)]
 struct Asteroids {
     clients: BTreeMap<u32, AsteroidClient>,
+    gravity: Vec<f64>,
+    integration_parameters: IntegrationParameters,
+    physics_pipeline: PhysicsPipeline,
+    island_manager: IslandManager,
+    broad_phase: DefaultBroadPhase,
+    narrow_phase: NarrowPhase,
+    impulse_joint_set: ImpulseJointSet,
+    multibody_joint_set: MultibodyJointSet,
+    ccd_solver: CCDSolver,
+    query_pipeline: QueryPipeline,
 }
 
 impl foxglove::websocket::ServerListener for AsteroidListener {
@@ -87,7 +99,6 @@ const UP: u32 = 1;
 const LEFT: u32 = 2;
 const DOWN: u32 = 4;
 const RIGHT: u32 = 8;
-const SHOOT: u32 = 16;
 
 const ROT_SPEED: f64 = 3.0;
 const ACCEL: f64 = 3.0;
@@ -95,7 +106,21 @@ const BRAKE: f64 = 0.8;
 
 impl AsteroidListener {
     fn new() -> Self {
-        Self::default()
+        Self {
+            asteroids: Mutex::new(Asteroids {
+                clients: BTreeMap::new(),
+                gravity: vec![0.0, 0.0],
+                integration_parameters: IntegrationParameters::default(),
+                physics_pipeline: PhysicsPipeline::new(),
+                island_manager: IslandManager::new(),
+                broad_phase: DefaultBroadPhase::new(),
+                narrow_phase: NarrowPhase::new(),
+                impulse_joint_set: ImpulseJointSet::new(),
+                multibody_joint_set: MultibodyJointSet::new(),
+                ccd_solver: CCDSolver::new(),
+                query_pipeline: QueryPipeline::new(),
+            }),
+        }
     }
 
     async fn tick(&self, dt: Duration) {
