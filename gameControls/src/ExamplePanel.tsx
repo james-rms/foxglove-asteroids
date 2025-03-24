@@ -2,9 +2,39 @@ import { Immutable, MessageEvent, PanelExtensionContext, Topic } from "@foxglove
 import React, { ReactElement, useEffect, useLayoutEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+const PLAYER = "james";
+
+type PressedKeys = {
+  a: boolean;
+  w: boolean;
+  s: boolean;
+  d: boolean;
+  " ": boolean;
+};
+
+function toBitmap(pressedKeys: PressedKeys): number {
+  return (
+    (pressedKeys.w ? 1 : 0) +
+    (pressedKeys.a ? 2 : 0) +
+    (pressedKeys.s ? 4 : 0) +
+    (pressedKeys.d ? 8 : 0) +
+    (pressedKeys[" "] ? 16 : 0)
+  );
+}
+
 function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactElement {
   const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
   const [messages, setMessages] = useState<undefined | Immutable<MessageEvent[]>>();
+  const [pressedKeys, setPressedKeys] = useState<PressedKeys>({
+    a: false,
+    w: false,
+    s: false,
+    d: false,
+    " ": false,
+  });
+  const [canPublish, setCanPublish] = useState<boolean | undefined>(undefined);
+
+  const keyPublishTopic = `/keys/${PLAYER}`;
 
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
 
@@ -45,8 +75,47 @@ function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactEle
 
     // subscribe to some topics, you could do this within other effects, based on input fields, etc
     // Once you subscribe to topics, currentFrame will contain message events from those topics (assuming there are messages).
-    context.subscribe([{ topic: "/some/topic" }]);
-  }, [context]);
+    context.subscribe([{ topic: "/server-pulse" }]);
+    if (context.advertise) {
+      context.advertise(keyPublishTopic, "std_msgs/Int");
+      setCanPublish(true);
+    } else {
+      setCanPublish(false);
+    }
+  }, [context, keyPublishTopic]);
+
+  // Set up keyboard event listeners
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      if (key in pressedKeys) {
+        setPressedKeys((pk) => ({ ...pk, [key]: true }));
+      }
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      if (key in pressedKeys) {
+        setPressedKeys((pk) => ({ ...pk, [key]: false }));
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    // Clean up the event listener on unmount
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  });
+
+  useEffect(() => {
+    if (canPublish != undefined && canPublish) {
+      const bitmap = toBitmap(pressedKeys);
+      console.log(`published ${bitmap} to ${keyPublishTopic}`);
+      context.publish!(keyPublishTopic, bitmap);
+    }
+  }, [canPublish, pressedKeys, keyPublishTopic, context]);
 
   // invoke the done callback once the render is complete
   useEffect(() => {
@@ -55,13 +124,40 @@ function ExamplePanel({ context }: { context: PanelExtensionContext }): ReactEle
 
   return (
     <div style={{ padding: "1rem" }}>
-      <h2>Welcome to your new extension panel!</h2>
-      <p>
-        Check the{" "}
-        <a href="https://foxglove.dev/docs/studio/extensions/getting-started">documentation</a> for
-        more details on building extension panels for Foxglove Studio.
-      </p>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: "0.2rem" }}>
+      <div
+        style={{
+          marginTop: "1rem",
+          padding: "0.5rem",
+          border: "1px solid #ccc",
+          borderRadius: "4px",
+        }}
+      >
+        {canPublish != undefined && canPublish ? "can publish" : "cannot publish"}
+        <h3>Keyboard Input</h3>
+        <p>
+          pressed keys:{" "}
+          <strong>
+            [
+            {Object.entries(pressedKeys)
+              .filter(([_, value]) => value)
+              .map(([key]) => key)
+              .join(", ")}
+            ]
+          </strong>
+        </p>
+        <p>
+          <em>Press W, A, S, D, or space to see it displayed here</em>
+        </p>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          rowGap: "0.2rem",
+          marginTop: "1rem",
+        }}
+      >
         <b style={{ borderBottom: "1px solid" }}>Topic</b>
         <b style={{ borderBottom: "1px solid" }}>Schema name</b>
         {(topics ?? []).map((topic) => (
