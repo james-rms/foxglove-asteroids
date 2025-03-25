@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::{Arc, Mutex},
-    time::{Duration, UNIX_EPOCH},
+    time::Duration,
 };
 
 use rapier2d::{na::Isometry, prelude::*};
@@ -22,18 +22,38 @@ struct AsteroidListener {
     asteroids: Mutex<Asteroids>,
 }
 
-#[derive(Default)]
-struct AsteroidClient {
+struct Player {
     name: String,
     keys_pressed: u32,
-    body_handle: RigidBodyHandle,
-    last_shot_tick: Option<u64>,
+    state: PlayerState,
+}
+
+enum PlayerState {
+    Alive {
+        handle: RigidBodyHandle,
+        health: u32,
+        last_shot_tick: Option<u64>,
+    },
+    Dead {
+        tick: u64,
+    },
 }
 
 struct Bullet {
-    handle: RigidBodyHandle,
+    handle: Option<RigidBodyHandle>,
     born_tick: u64,
-    alive: bool,
+}
+
+enum Rock {
+    Alive {
+        handle: RigidBodyHandle,
+        health: u32,
+    },
+    Dead {
+        tick: u64,
+        x: f32,
+        y: f32,
+    },
 }
 
 fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet) -> RigidBodyHandle {
@@ -51,15 +71,9 @@ fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet) 
 }
 
 fn log(message: String) {
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap();
-    let nanos = now.as_nanos();
-    let nsec = (nanos % 1_000_000_000) as u32;
-    let sec = (nanos / 1_000_000_000) as u32;
     LOGS.log(&Log {
-        timestamp: Some(Timestamp::new(sec, nsec)),
-        level: 2,
+        timestamp: Some(Timestamp::try_from(std::time::SystemTime::now()).unwrap()),
+        level: foxglove::schemas::log::Level::Info.into(),
         name: "system".into(),
         message,
         ..Default::default()
@@ -68,7 +82,7 @@ fn log(message: String) {
 
 #[derive(Default)]
 struct Asteroids {
-    clients: BTreeMap<u32, AsteroidClient>,
+    clients: BTreeMap<u32, Player>,
     gravity: Vector<f32>,
     rocks: Vec<RigidBodyHandle>,
     bullets: Vec<Bullet>,
@@ -148,7 +162,8 @@ const ACCEL: f32 = 0.025;
 const ROT_DAMP: f32 = 5.0;
 const BRAKE: f32 = 5.0;
 
-const SCENE_ENTITY_PBLISH_PERIOD: u64 = 10;
+const SCENE_ENTITY_PBLISH_PERIOD: u64 = 100;
+const TRANSFORM_PUBLISH_PERIOD: u64 = 10;
 const FIRE_PERIOD: u64 = 5;
 
 fn wrap_pos(body: &mut RigidBody) {
@@ -209,10 +224,10 @@ fn shoot(
     let body_handle = rigid_body_set.insert(rigid_body);
     collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
     let bullet = &mut bullets[*next_bullet_idx];
-    bullet.alive = true;
     bullet.born_tick = tick;
-    bullet.handle = body_handle;
-    *next_bullet_idx += 1;
+    bullet.handle = Some(body_handle);
+
+    *next_bullet_idx = (*next_bullet_idx + 1) % bullets.len();
 }
 
 impl AsteroidListener {
@@ -220,15 +235,14 @@ impl AsteroidListener {
         let mut collider_set = ColliderSet::new();
         let mut rigid_body_set = RigidBodySet::new();
         let mut rocks = Vec::with_capacity(10);
-        let mut bullets = Vec::with_capacity(1000);
+        let mut bullets = Vec::with_capacity(000);
         for _ in 0..10 {
             rocks.push(make_rock(&mut collider_set, &mut rigid_body_set));
         }
-        for _ in 0..1000 {
+        for _ in 0..100 {
             bullets.push(Bullet {
                 born_tick: 0,
-                alive: false,
-                handle: RigidBodyHandle::invalid(),
+                handle: None,
             })
         }
         Self {
@@ -257,38 +271,49 @@ impl AsteroidListener {
         // always forward-calculate the physics
         let mut state = self.asteroids.lock().unwrap();
         let asteroids = &mut *state;
-        for (_, client) in asteroids.clients.iter_mut() {
-            let body = &mut asteroids.rigid_body_set[client.body_handle];
-            if client.keys_pressed & UP != 0 {
-                let rot = body.rotation();
-                body.apply_impulse(Vector::new(rot.re * ACCEL, rot.im * ACCEL), true);
-            }
-            if client.keys_pressed & LEFT != 0 {
-                body.apply_torque_impulse(ROT_SPEED, true);
-            }
-            if client.keys_pressed & RIGHT != 0 {
-                body.apply_torque_impulse(-ROT_SPEED, true);
-            }
-            if client.keys_pressed & DOWN != 0 {
-                body.set_linear_damping(BRAKE);
-            } else {
-                body.set_linear_damping(0.0);
-            }
-            wrap_pos(body);
-            if client.keys_pressed & SHOOT != 0 {
-                match client.last_shot_tick {
-                    Some(tick) if tick + FIRE_PERIOD >= asteroids.tick_number => {}
-                    _ => {
-                        shoot(
-                            asteroids.tick_number,
-                            &mut asteroids.bullets,
-                            &mut asteroids.next_bullet_idx,
-                            &mut asteroids.collider_set,
-                            &mut asteroids.rigid_body_set,
-                            client.body_handle,
-                        );
-                        client.last_shot_tick = Some(asteroids.tick_number);
+        for (_, player) in asteroids.clients.iter_mut() {
+            match &mut player.state {
+                PlayerState::Alive {
+                    handle,
+                    last_shot_tick,
+                    ..
+                } => {
+                    let body = &mut asteroids.rigid_body_set[*handle];
+                    if player.keys_pressed & UP != 0 {
+                        let rot = body.rotation();
+                        body.apply_impulse(Vector::new(rot.re * ACCEL, rot.im * ACCEL), true);
                     }
+                    if player.keys_pressed & LEFT != 0 {
+                        body.apply_torque_impulse(ROT_SPEED, true);
+                    }
+                    if player.keys_pressed & RIGHT != 0 {
+                        body.apply_torque_impulse(-ROT_SPEED, true);
+                    }
+                    if player.keys_pressed & DOWN != 0 {
+                        body.set_linear_damping(BRAKE);
+                    } else {
+                        body.set_linear_damping(0.0);
+                    }
+                    wrap_pos(body);
+                    if player.keys_pressed & SHOOT != 0 {
+                        match *last_shot_tick {
+                            Some(tick) if tick + FIRE_PERIOD >= asteroids.tick_number => {}
+                            _ => {
+                                shoot(
+                                    asteroids.tick_number,
+                                    &mut asteroids.bullets,
+                                    &mut asteroids.next_bullet_idx,
+                                    &mut asteroids.collider_set,
+                                    &mut asteroids.rigid_body_set,
+                                    *handle,
+                                );
+                                *last_shot_tick = Some(asteroids.tick_number);
+                            }
+                        }
+                    }
+                }
+                PlayerState::Dead { tick } => {
+                    // TODO resurrect after a few ticks
                 }
             }
         }
@@ -299,19 +324,19 @@ impl AsteroidListener {
         }
 
         for bullet in asteroids.bullets.iter_mut() {
-            if bullet.alive {
-                let body = &mut asteroids.rigid_body_set[bullet.handle];
+            if let Some(handle) = bullet.handle {
+                let body = &mut asteroids.rigid_body_set[handle];
                 wrap_pos(body);
                 if bullet.born_tick + BULLET_LIFE < asteroids.tick_number {
                     asteroids.rigid_body_set.remove(
-                        bullet.handle,
+                        handle,
                         &mut asteroids.island_manager,
                         &mut asteroids.collider_set,
                         &mut asteroids.impulse_joint_set,
                         &mut asteroids.multibody_joint_set,
                         true,
                     );
-                    bullet.alive = false;
+                    bullet.handle = None;
                 }
             }
         }
@@ -336,31 +361,28 @@ impl AsteroidListener {
         );
         while let Ok(collision_event) = collision_recv.try_recv() {
             // Handle the collision event.
-            let body1 = asteroids
+            let Some(handle1) = asteroids
                 .collider_set
                 .get(collision_event.collider1())
-                .unwrap()
-                .parent();
-            let body2 = asteroids
+                .map(|collider| collider.parent())
+                .flatten()
+            else {
+                continue;
+            };
+            let Some(handle2) = asteroids
                 .collider_set
                 .get(collision_event.collider2())
-                .unwrap()
-                .parent();
-            for client in asteroids.clients.values() {
-                let mut did_bonk = false;
-                if let Some(handle) = body1 {
-                    if client.body_handle == handle {
-                        did_bonk = true;
+                .map(|collider| collider.parent())
+                .flatten()
+            else {
+                continue;
+            };
+            for player in asteroids.clients.values() {
+                if let PlayerState::Alive { handle, .. } = player.state {
+                    if handle == handle1 || handle == handle2 {
+                        let name = &player.name;
+                        log(format!("{name} bonked!"));
                     }
-                }
-                if let Some(handle) = body2 {
-                    if client.body_handle == handle {
-                        did_bonk = true;
-                    }
-                }
-                if did_bonk {
-                    let name = &client.name;
-                    log(format!("{name} bonked!"));
                 }
             }
         }
@@ -455,24 +477,30 @@ impl AsteroidListener {
         }
 
         let mut transforms = Vec::new();
-        for (id, client) in asteroids.clients.iter() {
-            let body = &asteroids.rigid_body_set[client.body_handle];
-            let pos = body.translation();
-            let rot = body.rotation();
-            let angle = rot.angle() / 2.0;
+        for (id, player) in asteroids.clients.iter() {
+            let (x, y, qz, qw) = match player.state {
+                PlayerState::Alive { handle, .. } => {
+                    let body = &asteroids.rigid_body_set[handle];
+                    let pos = body.translation();
+                    let rot = body.rotation();
+                    let angle = rot.angle() / 2.0;
+                    (pos.x, pos.y, angle.sin(), angle.cos())
+                }
+                PlayerState::Dead { .. } => (9999.0, 9999.0, 1.0, 0.0),
+            };
             transforms.push(FrameTransform {
                 parent_frame_id: "world".into(),
                 child_frame_id: format!("player_{id}"),
                 translation: Some(Vector3 {
-                    x: pos.x as _,
-                    y: pos.y as _,
+                    x: x as _,
+                    y: y as _,
                     z: 0.0,
                 }),
                 rotation: Some(Quaternion {
                     x: 0.,
                     y: 0.,
-                    z: angle.sin() as _,
-                    w: angle.cos() as _, // real component
+                    z: qz as _,
+                    w: qw as _, // real component
                 }),
                 ..Default::default()
             })
@@ -499,8 +527,7 @@ impl AsteroidListener {
             });
         }
         for (idx, bullet) in asteroids.bullets.iter().enumerate() {
-            let (x, y) = if bullet.alive {
-                let handle = bullet.handle;
+            let (x, y) = if let Some(handle) = bullet.handle {
                 let body = &asteroids.rigid_body_set[handle];
                 let pos = body.translation();
                 (pos.x, pos.y)
@@ -532,12 +559,15 @@ impl AsteroidListener {
 
         match clients.entry(client_id.into()) {
             Entry::Vacant(vacant) => {
-                let body_handle = make_player_body_handle(collider_set, rigid_body_set);
-                vacant.insert(AsteroidClient {
+                let handle = make_player_body_handle(collider_set, rigid_body_set);
+                vacant.insert(Player {
                     name: name.into(),
                     keys_pressed: 0,
-                    body_handle,
-                    last_shot_tick: None,
+                    state: PlayerState::Alive {
+                        handle,
+                        health: 10,
+                        last_shot_tick: None,
+                    },
                 });
                 log(format!("Welcome {name}"));
             }
@@ -558,12 +588,15 @@ impl AsteroidListener {
 
         match clients.entry(client_id.into()) {
             Entry::Vacant(vacant) => {
-                let body_handle = make_player_body_handle(collider_set, rigid_body_set);
-                vacant.insert(AsteroidClient {
+                let handle = make_player_body_handle(collider_set, rigid_body_set);
+                vacant.insert(Player {
                     name: "(nameless)".into(),
                     keys_pressed: keys,
-                    body_handle,
-                    last_shot_tick: None,
+                    state: PlayerState::Alive {
+                        handle,
+                        health: 10,
+                        last_shot_tick: None,
+                    },
                 });
             }
             Entry::Occupied(mut entry) => {
@@ -580,7 +613,7 @@ impl AsteroidListener {
             BOXES.log(&SceneUpdate {
                 deletions: vec![SceneEntityDeletion {
                     timestamp: None,
-                    r#type: 1,
+                    r#type: foxglove::schemas::scene_entity_deletion::Type::MatchingId.into(),
                     id: format!("player_{client_id}"),
                 }],
                 entities: Vec::new(),
