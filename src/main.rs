@@ -205,7 +205,7 @@ fn shoot(
             my_rot.im * BULLET_SPEED,
         ))
         .build();
-    let collider = ColliderBuilder::ball(0.05).build();
+    let collider = ColliderBuilder::ball(0.1).build();
     let body_handle = rigid_body_set.insert(rigid_body);
     collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
     let bullet = &mut bullets[*next_bullet_idx];
@@ -279,7 +279,6 @@ impl AsteroidListener {
                 match client.last_shot_tick {
                     Some(tick) if tick + FIRE_PERIOD >= asteroids.tick_number => {}
                     _ => {
-                        log(format!("{} shot!", client.name));
                         shoot(
                             asteroids.tick_number,
                             &mut asteroids.bullets,
@@ -300,17 +299,20 @@ impl AsteroidListener {
         }
 
         for bullet in asteroids.bullets.iter_mut() {
-            if bullet.alive && bullet.born_tick + BULLET_LIFE < asteroids.tick_number {
-                asteroids.rigid_body_set.remove(
-                    bullet.handle,
-                    &mut asteroids.island_manager,
-                    &mut asteroids.collider_set,
-                    &mut asteroids.impulse_joint_set,
-                    &mut asteroids.multibody_joint_set,
-                    true,
-                );
-                log(format!("bullet {:?} died", bullet.handle));
-                bullet.alive = false;
+            if bullet.alive {
+                let body = &mut asteroids.rigid_body_set[bullet.handle];
+                wrap_pos(body);
+                if bullet.born_tick + BULLET_LIFE < asteroids.tick_number {
+                    asteroids.rigid_body_set.remove(
+                        bullet.handle,
+                        &mut asteroids.island_manager,
+                        &mut asteroids.collider_set,
+                        &mut asteroids.impulse_joint_set,
+                        &mut asteroids.multibody_joint_set,
+                        true,
+                    );
+                    bullet.alive = false;
+                }
             }
         }
         let (collision_send, collision_recv) = crossbeam::channel::unbounded();
@@ -358,7 +360,7 @@ impl AsteroidListener {
                 }
                 if did_bonk {
                     let name = &client.name;
-                    log(format!("{name} hit something!"));
+                    log(format!("{name} bonked!"));
                 }
             }
         }
@@ -417,7 +419,7 @@ impl AsteroidListener {
                         }),
                         color: Some(Color {
                             r: 0.5,
-                            g: 0.5,
+                            g: 0.7,
                             b: 0.5,
                             a: 1.0,
                         }),
@@ -432,14 +434,14 @@ impl AsteroidListener {
                     spheres: vec![SpherePrimitive {
                         pose: None,
                         size: Some(Vector3 {
-                            x: 0.05,
-                            y: 0.05,
-                            z: 0.05,
+                            x: 0.1,
+                            y: 0.1,
+                            z: 0.1,
                         }),
                         color: Some(Color {
                             r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
+                            g: 0.3,
+                            b: 0.3,
                             a: 1.0,
                         }),
                     }],
