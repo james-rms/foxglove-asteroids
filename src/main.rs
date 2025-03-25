@@ -9,8 +9,8 @@ use rapier2d::{na::Isometry, prelude::*};
 use foxglove::{
     schemas::{
         Color, CubePrimitive, FrameTransform, FrameTransforms, Log, ModelPrimitive, Pose,
-        Quaternion, SceneEntity, SceneEntityDeletion, SceneUpdate, TextPrimitive, Timestamp,
-        Vector3,
+        Quaternion, SceneEntity, SceneEntityDeletion, SceneUpdate, SpherePrimitive, TextPrimitive,
+        Timestamp, Vector3,
     },
     websocket::{Capability, Client, ClientId},
 };
@@ -27,6 +27,13 @@ struct AsteroidClient {
     name: String,
     keys_pressed: u32,
     body_handle: RigidBodyHandle,
+    last_shot_tick: Option<u64>,
+}
+
+struct Bullet {
+    handle: RigidBodyHandle,
+    born_tick: u64,
+    alive: bool,
 }
 
 fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet) -> RigidBodyHandle {
@@ -64,6 +71,8 @@ struct Asteroids {
     clients: BTreeMap<u32, AsteroidClient>,
     gravity: Vector<f32>,
     rocks: Vec<RigidBodyHandle>,
+    bullets: Vec<Bullet>,
+    next_bullet_idx: usize,
     integration_parameters: IntegrationParameters,
     physics_pipeline: PhysicsPipeline,
     island_manager: IslandManager,
@@ -130,13 +139,17 @@ const UP: u32 = 1;
 const LEFT: u32 = 2;
 const DOWN: u32 = 4;
 const RIGHT: u32 = 8;
+const SHOOT: u32 = 16;
 
+const BULLET_SPEED: f32 = 5.0;
+const BULLET_LIFE: u64 = 100;
 const ROT_SPEED: f32 = 0.005;
 const ACCEL: f32 = 0.025;
 const ROT_DAMP: f32 = 5.0;
 const BRAKE: f32 = 5.0;
 
-const SCENE_ENTITY_PUBLISH_PERIOD: u64 = 10;
+const SCENE_ENTITY_PBLISH_PERIOD: u64 = 10;
+const FIRE_PERIOD: u64 = 5;
 
 fn wrap_pos(body: &mut RigidBody) {
     let mut pos = *body.translation();
@@ -170,18 +183,60 @@ fn wrap_pos(body: &mut RigidBody) {
     }
 }
 
+fn shoot(
+    tick: u64,
+    bullets: &mut Vec<Bullet>,
+    next_bullet_idx: &mut usize,
+    collider_set: &mut ColliderSet,
+    rigid_body_set: &mut RigidBodySet,
+    me: RigidBodyHandle,
+) {
+    let (my_pos, my_rot) = {
+        let body = &rigid_body_set[me];
+        (body.translation(), body.rotation())
+    };
+    let rigid_body = RigidBodyBuilder::dynamic()
+        .translation(vector![
+            my_pos.x + (my_rot.re * 0.5),
+            my_pos.y + (my_rot.im * 0.5)
+        ])
+        .linvel(Vector::new(
+            my_rot.re * BULLET_SPEED,
+            my_rot.im * BULLET_SPEED,
+        ))
+        .build();
+    let collider = ColliderBuilder::ball(0.05).build();
+    let body_handle = rigid_body_set.insert(rigid_body);
+    collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
+    let bullet = &mut bullets[*next_bullet_idx];
+    bullet.alive = true;
+    bullet.born_tick = tick;
+    bullet.handle = body_handle;
+    *next_bullet_idx += 1;
+}
+
 impl AsteroidListener {
     fn new() -> Self {
         let mut collider_set = ColliderSet::new();
         let mut rigid_body_set = RigidBodySet::new();
         let mut rocks = Vec::with_capacity(10);
+        let mut bullets = Vec::with_capacity(1000);
         for _ in 0..10 {
             rocks.push(make_rock(&mut collider_set, &mut rigid_body_set));
+        }
+        for _ in 0..1000 {
+            bullets.push(Bullet {
+                born_tick: 0,
+                alive: false,
+                handle: RigidBodyHandle::invalid(),
+            })
         }
         Self {
             asteroids: Mutex::new(Asteroids {
                 clients: BTreeMap::new(),
                 rocks,
+                bullets,
+                next_bullet_idx: 0,
                 gravity: Vector::new(0.0, 0.0),
                 integration_parameters: IntegrationParameters::default(),
                 physics_pipeline: PhysicsPipeline::new(),
@@ -219,13 +274,44 @@ impl AsteroidListener {
             } else {
                 body.set_linear_damping(0.0);
             }
-
             wrap_pos(body);
+            if client.keys_pressed & SHOOT != 0 {
+                match client.last_shot_tick {
+                    Some(tick) if tick + FIRE_PERIOD >= asteroids.tick_number => {}
+                    _ => {
+                        log(format!("{} shot!", client.name));
+                        shoot(
+                            asteroids.tick_number,
+                            &mut asteroids.bullets,
+                            &mut asteroids.next_bullet_idx,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.rigid_body_set,
+                            client.body_handle,
+                        );
+                        client.last_shot_tick = Some(asteroids.tick_number);
+                    }
+                }
+            }
         }
 
         for handle in asteroids.rocks.iter() {
             let body = &mut asteroids.rigid_body_set[*handle];
             wrap_pos(body);
+        }
+
+        for bullet in asteroids.bullets.iter_mut() {
+            if bullet.alive && bullet.born_tick + BULLET_LIFE < asteroids.tick_number {
+                asteroids.rigid_body_set.remove(
+                    bullet.handle,
+                    &mut asteroids.island_manager,
+                    &mut asteroids.collider_set,
+                    &mut asteroids.impulse_joint_set,
+                    &mut asteroids.multibody_joint_set,
+                    true,
+                );
+                log(format!("bullet {:?} died", bullet.handle));
+                bullet.alive = false;
+            }
         }
         let (collision_send, collision_recv) = crossbeam::channel::unbounded();
         let (contact_force_send, _) = crossbeam::channel::unbounded();
@@ -277,7 +363,7 @@ impl AsteroidListener {
             }
         }
 
-        if asteroids.tick_number % SCENE_ENTITY_PUBLISH_PERIOD == 0 {
+        if asteroids.tick_number % SCENE_ENTITY_PBLISH_PERIOD == 0 {
             let mut entities = Vec::new();
 
             for (id, client) in asteroids.clients.iter() {
@@ -339,6 +425,27 @@ impl AsteroidListener {
                     ..Default::default()
                 })
             }
+            for (idx, _) in asteroids.bullets.iter().enumerate() {
+                entities.push(SceneEntity {
+                    id: format!("bullet_{idx}"),
+                    frame_id: format!("bullet_{idx}"),
+                    spheres: vec![SpherePrimitive {
+                        pose: None,
+                        size: Some(Vector3 {
+                            x: 0.05,
+                            y: 0.05,
+                            z: 0.05,
+                        }),
+                        color: Some(Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        }),
+                    }],
+                    ..Default::default()
+                })
+            }
             BOXES.log(&SceneUpdate {
                 deletions: Vec::new(),
                 entities,
@@ -389,6 +496,26 @@ impl AsteroidListener {
                 ..Default::default()
             });
         }
+        for (idx, bullet) in asteroids.bullets.iter().enumerate() {
+            let (x, y) = if bullet.alive {
+                let handle = bullet.handle;
+                let body = &asteroids.rigid_body_set[handle];
+                let pos = body.translation();
+                (pos.x, pos.y)
+            } else {
+                (99999.0, 99999.0)
+            };
+            transforms.push(FrameTransform {
+                parent_frame_id: "world".into(),
+                child_frame_id: format!("bullet_{idx}"),
+                translation: Some(Vector3 {
+                    x: x as _,
+                    y: y as _,
+                    z: 0.0,
+                }),
+                ..Default::default()
+            });
+        }
 
         TF.log(&FrameTransforms { transforms });
         asteroids.tick_number += 1;
@@ -408,6 +535,7 @@ impl AsteroidListener {
                     name: name.into(),
                     keys_pressed: 0,
                     body_handle,
+                    last_shot_tick: None,
                 });
                 log(format!("Welcome {name}"));
             }
@@ -433,6 +561,7 @@ impl AsteroidListener {
                     name: "(nameless)".into(),
                     keys_pressed: keys,
                     body_handle,
+                    last_shot_tick: None,
                 });
             }
             Entry::Occupied(mut entry) => {
