@@ -227,6 +227,9 @@ impl AsteroidListener {
             let body = &mut asteroids.rigid_body_set[*handle];
             wrap_pos(body);
         }
+        let (collision_send, collision_recv) = crossbeam::channel::unbounded();
+        let (contact_force_send, _) = crossbeam::channel::unbounded();
+        let event_handler = ChannelEventCollector::new(collision_send, contact_force_send);
 
         asteroids.physics_pipeline.step(
             &asteroids.gravity,
@@ -241,8 +244,38 @@ impl AsteroidListener {
             &mut asteroids.ccd_solver,
             None,
             &(),
-            &(),
+            &event_handler,
         );
+        while let Ok(collision_event) = collision_recv.try_recv() {
+            // Handle the collision event.
+            let body1 = asteroids
+                .collider_set
+                .get(collision_event.collider1())
+                .unwrap()
+                .parent();
+            let body2 = asteroids
+                .collider_set
+                .get(collision_event.collider2())
+                .unwrap()
+                .parent();
+            for client in asteroids.clients.values() {
+                let mut did_bonk = false;
+                if let Some(handle) = body1 {
+                    if client.body_handle == handle {
+                        did_bonk = true;
+                    }
+                }
+                if let Some(handle) = body2 {
+                    if client.body_handle == handle {
+                        did_bonk = true;
+                    }
+                }
+                if did_bonk {
+                    let name = &client.name;
+                    log(format!("{name} hit something!"));
+                }
+            }
+        }
 
         if asteroids.tick_number % SCENE_ENTITY_PUBLISH_PERIOD == 0 {
             let mut entities = Vec::new();
@@ -434,7 +467,9 @@ fn make_player_body_handle(
         .translation(vector![0.0, 0.0])
         .angular_damping(ROT_DAMP)
         .build();
-    let collider = ColliderBuilder::cuboid(0.25, 0.25).build();
+    let collider = ColliderBuilder::cuboid(0.25, 0.25)
+        .active_events(ActiveEvents::COLLISION_EVENTS)
+        .build();
     let body_handle = rigid_body_set.insert(rigid_body);
     collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
     body_handle
