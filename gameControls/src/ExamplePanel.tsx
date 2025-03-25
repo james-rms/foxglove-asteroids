@@ -1,5 +1,5 @@
 import { Immutable, MessageEvent, PanelExtensionContext, Topic } from "@foxglove/extension";
-import React, { ReactElement, useEffect, useLayoutEffect, useState } from "react";
+import React, { FormEvent, ReactElement, useEffect, useLayoutEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 type PressedKeys = {
@@ -20,7 +20,42 @@ function toBitmap(pressedKeys: PressedKeys): number {
   );
 }
 
-function KeyListenPanel({ context }: { context: PanelExtensionContext }): ReactElement {
+function ParentPanel({ context }: { context: PanelExtensionContext }): ReactElement {
+  const [inputValue, setInputValue] = useState("");
+  const [nickname, setNickname] = useState<undefined | string>(undefined);
+
+  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault(); // prevent page reload
+    setNickname(inputValue);
+    setInputValue(""); // clear input if desired
+  };
+
+  return nickname == undefined ? (
+    <>
+      <form onSubmit={handleSubmit}>
+        <input
+          type="text"
+          placeholder="Enter your name"
+          value={inputValue}
+          onChange={(e) => {
+            setInputValue(e.target.value);
+          }}
+        />
+        <button type="submit">Submit</button>
+      </form>
+    </>
+  ) : (
+    <KeyListenPanel context={context} nickname={nickname} />
+  );
+}
+
+function KeyListenPanel({
+  context,
+  nickname,
+}: {
+  context: PanelExtensionContext;
+  nickname: string;
+}): ReactElement {
   const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
   const [messages, setMessages] = useState<undefined | Immutable<MessageEvent[]>>();
   const [pressedKeys, setPressedKeys] = useState<PressedKeys>({
@@ -110,8 +145,9 @@ function KeyListenPanel({ context }: { context: PanelExtensionContext }): ReactE
     if (canPublish != undefined && canPublish) {
       const bitmap = toBitmap(pressedKeys);
       context.publish!("/keys", bitmap);
+      context.publish!("/my-name-is", nickname);
     }
-  }, [canPublish, pressedKeys, context]);
+  }, [canPublish, pressedKeys, context, nickname]);
 
   // invoke the done callback once the render is complete
   useEffect(() => {
@@ -170,7 +206,7 @@ function KeyListenPanel({ context }: { context: PanelExtensionContext }): ReactE
 
 export function initExamplePanel(context: PanelExtensionContext): () => void {
   const root = createRoot(context.panelElement);
-  root.render(<KeyListenPanel context={context} />);
+  root.render(<ParentPanel context={context} />);
 
   // Return a function to run when the panel is removed
   return () => {

@@ -564,6 +564,7 @@ name = "hackathon"
 version = "0.1.0"
 dependencies = [
  "foxglove",
+ "rand",
  "rapier2d",
  "tokio",
 ]

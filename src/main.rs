@@ -8,8 +8,8 @@ use rapier2d::{na::Isometry, prelude::*};
 
 use foxglove::{
     schemas::{
-        ArrowPrimitive, Color, FrameTransform, FrameTransforms, Quaternion, SceneEntity,
-        SceneUpdate, Vector3,
+        Color, CubePrimitive, FrameTransform, FrameTransforms, Log, ModelPrimitive, Pose,
+        Quaternion, SceneEntity, SceneEntityDeletion, SceneUpdate, TextPrimitive, Vector3,
     },
     websocket::{Capability, ClientId},
 };
@@ -28,10 +28,25 @@ struct AsteroidClient {
     body_handle: RigidBodyHandle,
 }
 
+fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet) -> RigidBodyHandle {
+    let x = rand::random_range(-WORLD_BOUND..WORLD_BOUND);
+    let y = rand::random_range(-WORLD_BOUND..WORLD_BOUND);
+    let rigid_body = RigidBodyBuilder::dynamic()
+        .translation(vector![x, y])
+        .angular_damping(ROT_DAMP)
+        .rotation(rand::random_range(0.0..10.0))
+        .build();
+    let collider = ColliderBuilder::cuboid(0.25, 0.25).build();
+    let body_handle = rigid_body_set.insert(rigid_body);
+    collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
+    body_handle
+}
+
 #[derive(Default)]
 struct Asteroids {
     clients: BTreeMap<u32, AsteroidClient>,
     gravity: Vector<f32>,
+    rocks: Vec<RigidBodyHandle>,
     integration_parameters: IntegrationParameters,
     physics_pipeline: PhysicsPipeline,
     island_manager: IslandManager,
@@ -42,15 +57,16 @@ struct Asteroids {
     ccd_solver: CCDSolver,
     collider_set: ColliderSet,
     rigid_body_set: RigidBodySet,
+    tick_number: u64,
 }
 
 impl foxglove::websocket::ServerListener for AsteroidListener {
-    fn on_client_advertise(
+    fn on_client_unadvertise(
         &self,
         client: foxglove::websocket::Client,
-        channel: &foxglove::websocket::ClientChannel,
+        _channel: &foxglove::websocket::ClientChannel,
     ) {
-        println!("new client: {client:?}, channel: {channel:?}");
+        self.remove_client(client.id());
     }
 
     fn on_message_data(
@@ -91,22 +107,64 @@ impl foxglove::websocket::ServerListener for AsteroidListener {
 
 foxglove::static_typed_channel!(BOXES, "/scene", foxglove::schemas::SceneUpdate);
 foxglove::static_typed_channel!(TF, "/tf", foxglove::schemas::FrameTransforms);
+foxglove::static_typed_channel!(LOGS, "/logs", foxglove::schemas::Log);
 
 const UP: u32 = 1;
 const LEFT: u32 = 2;
 const DOWN: u32 = 4;
 const RIGHT: u32 = 8;
 
-const ROT_SPEED: f32 = 0.1;
-const ACCEL: f32 = 0.1;
+const ROT_SPEED: f32 = 0.005;
+const ACCEL: f32 = 0.025;
 const ROT_DAMP: f32 = 5.0;
 const BRAKE: f32 = 5.0;
 
+const SCENE_ENTITY_PUBLISH_PERIOD: u64 = 10;
+
+fn wrap_pos(body: &mut RigidBody) {
+    let mut pos = *body.translation();
+    let mut modified = false;
+    if pos.x > WORLD_BOUND {
+        pos.x -= 2. * WORLD_BOUND;
+        modified = true;
+    }
+    if pos.x < -WORLD_BOUND {
+        pos.x += 2. * WORLD_BOUND;
+        modified = true;
+    }
+    if pos.y > WORLD_BOUND {
+        pos.y -= 2. * WORLD_BOUND;
+        modified = true;
+    }
+    if pos.y < -WORLD_BOUND {
+        pos.y += 2. * WORLD_BOUND;
+        modified = true;
+    }
+    if modified {
+        body.set_position(
+            Isometry {
+                rotation: *body.rotation(),
+                translation: Translation {
+                    vector: Vector::new(pos.x, pos.y),
+                },
+            },
+            true,
+        );
+    }
+}
+
 impl AsteroidListener {
     fn new() -> Self {
+        let mut collider_set = ColliderSet::new();
+        let mut rigid_body_set = RigidBodySet::new();
+        let mut rocks = Vec::with_capacity(10);
+        for _ in 0..10 {
+            rocks.push(make_rock(&mut collider_set, &mut rigid_body_set));
+        }
         Self {
             asteroids: Mutex::new(Asteroids {
                 clients: BTreeMap::new(),
+                rocks,
                 gravity: Vector::new(0.0, 0.0),
                 integration_parameters: IntegrationParameters::default(),
                 physics_pipeline: PhysicsPipeline::new(),
@@ -116,8 +174,9 @@ impl AsteroidListener {
                 impulse_joint_set: ImpulseJointSet::new(),
                 multibody_joint_set: MultibodyJointSet::new(),
                 ccd_solver: CCDSolver::new(),
-                collider_set: ColliderSet::new(),
-                rigid_body_set: RigidBodySet::new(),
+                collider_set,
+                rigid_body_set,
+                tick_number: 0,
             }),
         }
     }
@@ -127,42 +186,31 @@ impl AsteroidListener {
         let mut state = self.asteroids.lock().unwrap();
         let asteroids = &mut *state;
         for (_, client) in asteroids.clients.iter_mut() {
-            let body_handle = &mut asteroids.rigid_body_set[client.body_handle];
+            let body = &mut asteroids.rigid_body_set[client.body_handle];
             if client.keys_pressed & UP != 0 {
-                let rot = body_handle.rotation();
-                body_handle.apply_impulse(Vector::new(rot.re * ACCEL, rot.im * ACCEL), true);
+                let rot = body.rotation();
+                body.apply_impulse(Vector::new(rot.re * ACCEL, rot.im * ACCEL), true);
             }
             if client.keys_pressed & LEFT != 0 {
-                body_handle.apply_torque_impulse(ROT_SPEED, true);
+                body.apply_torque_impulse(ROT_SPEED, true);
             }
             if client.keys_pressed & RIGHT != 0 {
-                body_handle.apply_torque_impulse(-ROT_SPEED, true);
+                body.apply_torque_impulse(-ROT_SPEED, true);
             }
             if client.keys_pressed & DOWN != 0 {
-                body_handle.set_linear_damping(BRAKE);
+                body.set_linear_damping(BRAKE);
             } else {
-                body_handle.set_linear_damping(0.0);
+                body.set_linear_damping(0.0);
             }
 
-            let pos = body_handle.translation();
-            if pos.x > WORLD_BOUND
-                || pos.x < WORLD_BOUND
-                || pos.y > WORLD_BOUND
-                || pos.y < WORLD_BOUND
-            {
-                let new_x = ((pos.x + WORLD_BOUND) % (WORLD_BOUND * 2.0)) - WORLD_BOUND;
-                let new_y = ((pos.y + WORLD_BOUND) % (WORLD_BOUND * 2.0)) - WORLD_BOUND;
-                body_handle.set_position(
-                    Isometry {
-                        rotation: *body_handle.rotation(),
-                        translation: Translation {
-                            vector: Vector::new(new_x, new_y),
-                        },
-                    },
-                    true,
-                );
-            }
+            wrap_pos(body);
         }
+
+        for handle in asteroids.rocks.iter() {
+            let body = &mut asteroids.rigid_body_set[*handle];
+            wrap_pos(body);
+        }
+
         asteroids.physics_pipeline.step(
             &asteroids.gravity,
             &mut asteroids.integration_parameters,
@@ -179,62 +227,121 @@ impl AsteroidListener {
             &(),
         );
 
-        let entities = state
-            .clients
-            .iter()
-            .map(|(&id, _)| SceneEntity {
-                id: id.to_string(),
-                frame_id: format!("player_{id}"),
-                arrows: vec![ArrowPrimitive {
-                    pose: None,
-                    shaft_diameter: 0.1,
-                    shaft_length: 0.5,
-                    head_diameter: 0.15,
-                    head_length: 0.1,
-                    color: Some(Color {
-                        r: 0.1,
-                        g: 0.4,
-                        b: 0.8,
-                        a: 1.0,
-                    }),
-                }],
+        if asteroids.tick_number % SCENE_ENTITY_PUBLISH_PERIOD == 0 {
+            let mut entities = Vec::new();
+
+            for (id, client) in asteroids.clients.iter() {
+                entities.push(SceneEntity {
+                    id: format!("player_{id}"),
+                    frame_id: format!("player_{id}"),
+                    models: vec![ModelPrimitive {
+                        pose: Some(Pose {
+                            position: None,
+                            orientation: Some(Quaternion {
+                                x: 0.0,
+                                y: 0.0,
+                                z: -0.707,
+                                w: 0.707,
+                            }),
+                        }),
+                        color: Some(Color {
+                            r: 0.1,
+                            g: 0.4,
+                            b: 0.8,
+                            a: 1.0,
+                        }),
+                        scale: Some(Vector3 {
+                            x: 0.25,
+                            y: 0.25,
+                            z: 0.25,
+                        }),
+                        // override_color: true,
+                        url: "file:///Users/j/ship.glb".into(),
+                        ..Default::default()
+                    }],
+                    texts: vec![TextPrimitive {
+                        billboard: true,
+                        font_size: 0.2,
+                        text: format!("\n\n\n\n{}", client.name),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+            for handle in asteroids.rocks.iter() {
+                entities.push(SceneEntity {
+                    id: format!("rock_{handle:?}"),
+                    frame_id: format!("rock_{handle:?}"),
+                    cubes: vec![CubePrimitive {
+                        pose: None,
+                        size: Some(Vector3 {
+                            x: 0.5,
+                            y: 0.5,
+                            z: 0.5,
+                        }),
+                        color: Some(Color {
+                            r: 0.5,
+                            g: 0.5,
+                            b: 0.5,
+                            a: 1.0,
+                        }),
+                    }],
+                    ..Default::default()
+                })
+            }
+            BOXES.log(&SceneUpdate {
+                deletions: Vec::new(),
+                entities,
+            });
+        }
+
+        let mut transforms = Vec::new();
+        for (id, client) in asteroids.clients.iter() {
+            let body = &asteroids.rigid_body_set[client.body_handle];
+            let pos = body.translation();
+            let rot = body.rotation();
+            let angle = rot.angle() / 2.0;
+            transforms.push(FrameTransform {
+                parent_frame_id: "world".into(),
+                child_frame_id: format!("player_{id}"),
+                translation: Some(Vector3 {
+                    x: pos.x as _,
+                    y: pos.y as _,
+                    z: 0.0,
+                }),
+                rotation: Some(Quaternion {
+                    x: 0.,
+                    y: 0.,
+                    z: angle.sin() as _,
+                    w: angle.cos() as _, // real component
+                }),
                 ..Default::default()
             })
-            .collect();
-        BOXES.log(&SceneUpdate {
-            deletions: Vec::new(),
-            entities,
-        });
-
-        let transforms = state
-            .clients
-            .iter()
-            .map(|(&id, client)| {
-                let body = &state.rigid_body_set[client.body_handle];
-                let pos = body.translation();
-                let rot = body.rotation();
-                let angle = rot.angle() / 2.0;
-                FrameTransform {
-                    parent_frame_id: "world".into(),
-                    child_frame_id: format!("player_{id}"),
-                    translation: Some(Vector3 {
-                        x: pos.x as _,
-                        y: pos.y as _,
-                        z: 0.0,
-                    }),
-                    rotation: Some(Quaternion {
-                        x: 0.,
-                        y: 0.,
-                        z: angle.sin() as _,
-                        w: angle.cos() as _, // real component
-                    }),
-                    ..Default::default()
-                }
-            })
-            .collect();
+        }
+        for handle in asteroids.rocks.iter() {
+            let body = &asteroids.rigid_body_set[*handle];
+            let pos = body.translation();
+            let angle = body.rotation().angle() / 2.0;
+            transforms.push(FrameTransform {
+                parent_frame_id: "world".into(),
+                child_frame_id: format!("rock_{handle:?}"),
+                translation: Some(Vector3 {
+                    x: pos.x as _,
+                    y: pos.y as _,
+                    z: 0.0,
+                }),
+                rotation: Some(Quaternion {
+                    x: 0.,
+                    y: 0.,
+                    z: angle.sin() as _,
+                    w: angle.cos() as _, // real component
+                }),
+                ..Default::default()
+            });
+        }
 
         TF.log(&FrameTransforms { transforms });
-        // every 2hz, publish the boxes
+        asteroids.tick_number += 1;
     }
 
     fn set_client_name(&self, client_id: ClientId, name: &str) {
@@ -252,9 +359,19 @@ impl AsteroidListener {
                     keys_pressed: 0,
                     body_handle,
                 });
+                LOGS.log(&Log {
+                    message: format!("Welcome {name}!"),
+                    ..Default::default()
+                });
             }
             Entry::Occupied(mut entry) => {
-                entry.get_mut().name = name.into();
+                if entry.get().name != name {
+                    entry.get_mut().name = name.into();
+                    LOGS.log(&Log {
+                        message: format!("Welcome {name}!"),
+                        ..Default::default()
+                    });
+                }
             }
         }
     }
@@ -279,6 +396,26 @@ impl AsteroidListener {
             }
         }
     }
+    fn remove_client(&self, client_id: ClientId) {
+        let mut state = self.asteroids.lock().unwrap();
+        let asteroids = &mut *state;
+        let client_id: u32 = client_id.into();
+        if let Some(client) = asteroids.clients.remove(&client_id) {
+            let name = client.name;
+            BOXES.log(&SceneUpdate {
+                deletions: vec![SceneEntityDeletion {
+                    timestamp: None,
+                    r#type: 1,
+                    id: format!("player_{client_id}"),
+                }],
+                entities: Vec::new(),
+            });
+            LOGS.log(&Log {
+                message: format!("Goodbye {name}!"),
+                ..Default::default()
+            });
+        }
+    }
 }
 
 fn make_player_body_handle(
@@ -289,7 +426,7 @@ fn make_player_body_handle(
         .translation(vector![0.0, 0.0])
         .angular_damping(ROT_DAMP)
         .build();
-    let collider = ColliderBuilder::cuboid(0.5, 0.5).build();
+    let collider = ColliderBuilder::cuboid(0.25, 0.25).build();
     let body_handle = rigid_body_set.insert(rigid_body);
     collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
     body_handle
