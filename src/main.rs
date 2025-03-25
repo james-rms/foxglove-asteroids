@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use rapier2d::prelude::*;
+use rapier2d::{na::Isometry, prelude::*};
 
 use foxglove::{
     schemas::{
@@ -14,7 +14,7 @@ use foxglove::{
     websocket::{Capability, ClientId},
 };
 
-const WORLD_BOUND: f64 = 5.0;
+const WORLD_BOUND: f32 = 5.0;
 
 #[derive(Default)]
 struct AsteroidListener {
@@ -25,17 +25,13 @@ struct AsteroidListener {
 struct AsteroidClient {
     name: String,
     keys_pressed: u32,
-    x: f64,
-    dx: f64,
-    y: f64,
-    dy: f64,
-    r: f64,
+    body_handle: RigidBodyHandle,
 }
 
 #[derive(Default)]
 struct Asteroids {
     clients: BTreeMap<u32, AsteroidClient>,
-    gravity: Vec<f64>,
+    gravity: Vector<f32>,
     integration_parameters: IntegrationParameters,
     physics_pipeline: PhysicsPipeline,
     island_manager: IslandManager,
@@ -44,7 +40,8 @@ struct Asteroids {
     impulse_joint_set: ImpulseJointSet,
     multibody_joint_set: MultibodyJointSet,
     ccd_solver: CCDSolver,
-    query_pipeline: QueryPipeline,
+    collider_set: ColliderSet,
+    rigid_body_set: RigidBodySet,
 }
 
 impl foxglove::websocket::ServerListener for AsteroidListener {
@@ -100,16 +97,17 @@ const LEFT: u32 = 2;
 const DOWN: u32 = 4;
 const RIGHT: u32 = 8;
 
-const ROT_SPEED: f64 = 3.0;
-const ACCEL: f64 = 3.0;
-const BRAKE: f64 = 0.8;
+const ROT_SPEED: f32 = 0.1;
+const ACCEL: f32 = 0.1;
+const ROT_DAMP: f32 = 5.0;
+const BRAKE: f32 = 5.0;
 
 impl AsteroidListener {
     fn new() -> Self {
         Self {
             asteroids: Mutex::new(Asteroids {
                 clients: BTreeMap::new(),
-                gravity: vec![0.0, 0.0],
+                gravity: Vector::new(0.0, 0.0),
                 integration_parameters: IntegrationParameters::default(),
                 physics_pipeline: PhysicsPipeline::new(),
                 island_manager: IslandManager::new(),
@@ -118,46 +116,69 @@ impl AsteroidListener {
                 impulse_joint_set: ImpulseJointSet::new(),
                 multibody_joint_set: MultibodyJointSet::new(),
                 ccd_solver: CCDSolver::new(),
-                query_pipeline: QueryPipeline::new(),
+                collider_set: ColliderSet::new(),
+                rigid_body_set: RigidBodySet::new(),
             }),
         }
     }
 
-    async fn tick(&self, dt: Duration) {
+    fn tick(&self) {
         // always forward-calculate the physics
         let mut state = self.asteroids.lock().unwrap();
-        let dt = dt.as_secs_f64();
-        for (_, client) in state.clients.iter_mut() {
+        let asteroids = &mut *state;
+        for (_, client) in asteroids.clients.iter_mut() {
+            let body_handle = &mut asteroids.rigid_body_set[client.body_handle];
             if client.keys_pressed & UP != 0 {
-                client.dx += client.r.cos() * ACCEL * dt;
-                client.dy += client.r.sin() * ACCEL * dt;
+                let rot = body_handle.rotation();
+                body_handle.apply_impulse(Vector::new(rot.re * ACCEL, rot.im * ACCEL), true);
             }
             if client.keys_pressed & LEFT != 0 {
-                client.r += ROT_SPEED * dt;
+                body_handle.apply_torque_impulse(ROT_SPEED, true);
             }
             if client.keys_pressed & RIGHT != 0 {
-                client.r -= ROT_SPEED * dt;
+                body_handle.apply_torque_impulse(-ROT_SPEED, true);
             }
             if client.keys_pressed & DOWN != 0 {
-                client.dx *= BRAKE;
-                client.dy *= BRAKE;
+                body_handle.set_linear_damping(BRAKE);
+            } else {
+                body_handle.set_linear_damping(0.0);
             }
-            client.x = client.x + client.dx * dt;
-            client.y = client.y + client.dy * dt;
 
-            while client.x > WORLD_BOUND {
-                client.x -= WORLD_BOUND * 2.;
-            }
-            while client.x < -WORLD_BOUND {
-                client.x += WORLD_BOUND * 2.;
-            }
-            while client.y > WORLD_BOUND {
-                client.y -= WORLD_BOUND * 2.;
-            }
-            while client.y < -WORLD_BOUND {
-                client.y += WORLD_BOUND * 2.;
+            let pos = body_handle.translation();
+            if pos.x > WORLD_BOUND
+                || pos.x < WORLD_BOUND
+                || pos.y > WORLD_BOUND
+                || pos.y < WORLD_BOUND
+            {
+                let new_x = ((pos.x + WORLD_BOUND) % (WORLD_BOUND * 2.0)) - WORLD_BOUND;
+                let new_y = ((pos.y + WORLD_BOUND) % (WORLD_BOUND * 2.0)) - WORLD_BOUND;
+                body_handle.set_position(
+                    Isometry {
+                        rotation: *body_handle.rotation(),
+                        translation: Translation {
+                            vector: Vector::new(new_x, new_y),
+                        },
+                    },
+                    true,
+                );
             }
         }
+        asteroids.physics_pipeline.step(
+            &asteroids.gravity,
+            &mut asteroids.integration_parameters,
+            &mut asteroids.island_manager,
+            &mut asteroids.broad_phase,
+            &mut asteroids.narrow_phase,
+            &mut asteroids.rigid_body_set,
+            &mut asteroids.collider_set,
+            &mut asteroids.impulse_joint_set,
+            &mut asteroids.multibody_joint_set,
+            &mut asteroids.ccd_solver,
+            None,
+            &(),
+            &(),
+        );
+
         let entities = state
             .clients
             .iter()
@@ -188,21 +209,27 @@ impl AsteroidListener {
         let transforms = state
             .clients
             .iter()
-            .map(|(&id, client)| FrameTransform {
-                parent_frame_id: "world".into(),
-                child_frame_id: format!("player_{id}"),
-                translation: Some(Vector3 {
-                    x: client.x,
-                    y: client.y,
-                    z: 0.0,
-                }),
-                rotation: Some(Quaternion {
-                    x: 0.,
-                    y: 0.,
-                    z: (client.r / 2.).sin(),
-                    w: (client.r / 2.).cos(),
-                }),
-                ..Default::default()
+            .map(|(&id, client)| {
+                let body = &state.rigid_body_set[client.body_handle];
+                let pos = body.translation();
+                let rot = body.rotation();
+                let angle = rot.angle() / 2.0;
+                FrameTransform {
+                    parent_frame_id: "world".into(),
+                    child_frame_id: format!("player_{id}"),
+                    translation: Some(Vector3 {
+                        x: pos.x as _,
+                        y: pos.y as _,
+                        z: 0.0,
+                    }),
+                    rotation: Some(Quaternion {
+                        x: 0.,
+                        y: 0.,
+                        z: angle.sin() as _,
+                        w: angle.cos() as _, // real component
+                    }),
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -211,33 +238,61 @@ impl AsteroidListener {
     }
 
     fn set_client_name(&self, client_id: ClientId, name: &str) {
-        self.asteroids
-            .lock()
-            .unwrap()
-            .clients
-            .entry(client_id.into())
-            .and_modify(|c| c.name = name.into())
-            .or_insert(AsteroidClient {
-                name: name.into(),
-                ..Default::default()
-            });
+        let mut state = self.asteroids.lock().unwrap();
+        let asteroids = &mut *state;
+        let clients = &mut asteroids.clients;
+        let collider_set = &mut asteroids.collider_set;
+        let rigid_body_set = &mut asteroids.rigid_body_set;
+
+        match clients.entry(client_id.into()) {
+            Entry::Vacant(vacant) => {
+                let body_handle = make_player_body_handle(collider_set, rigid_body_set);
+                vacant.insert(AsteroidClient {
+                    name: name.into(),
+                    keys_pressed: 0,
+                    body_handle,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().name = name.into();
+            }
+        }
     }
     fn set_client_keys(&self, client_id: ClientId, keys: u32) {
-        self.asteroids
-            .lock()
-            .unwrap()
-            .clients
-            .entry(client_id.into())
-            .and_modify(|c| {
-                c.keys_pressed = keys;
-                let name = &c.name;
-            })
-            .or_insert(AsteroidClient {
-                name: "(nameless)".into(),
-                keys_pressed: keys,
-                ..Default::default()
-            });
+        let mut state = self.asteroids.lock().unwrap();
+        let asteroids = &mut *state;
+        let clients = &mut asteroids.clients;
+        let collider_set = &mut asteroids.collider_set;
+        let rigid_body_set = &mut asteroids.rigid_body_set;
+
+        match clients.entry(client_id.into()) {
+            Entry::Vacant(vacant) => {
+                let body_handle = make_player_body_handle(collider_set, rigid_body_set);
+                vacant.insert(AsteroidClient {
+                    name: "(nameless)".into(),
+                    keys_pressed: keys,
+                    body_handle,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().keys_pressed = keys;
+            }
+        }
     }
+}
+
+fn make_player_body_handle(
+    collider_set: &mut ColliderSet,
+    rigid_body_set: &mut RigidBodySet,
+) -> RigidBodyHandle {
+    let rigid_body = RigidBodyBuilder::dynamic()
+        .translation(vector![0.0, 0.0])
+        .angular_damping(ROT_DAMP)
+        .build();
+    let collider = ColliderBuilder::cuboid(0.5, 0.5).build();
+    let body_handle = rigid_body_set.insert(rigid_body);
+    collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
+    body_handle
 }
 
 #[tokio::main]
@@ -254,12 +309,10 @@ async fn main() {
         .expect("Failed to start visualization server");
     println!("server started on localhost:9999");
     let mut interval = tokio::time::interval(Duration::from_millis(10));
-    let mut last_tick_time = std::time::Instant::now();
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                asteroids.tick(last_tick_time.elapsed()).await;
-                last_tick_time = std::time::Instant::now();
+                asteroids.tick();
             },
             res = tokio::signal::ctrl_c() => {
                 res.expect("failed to wait for sigint");
