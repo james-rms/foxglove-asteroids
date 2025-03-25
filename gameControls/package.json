@@ -1,11 +1,11 @@
 {
-  "name": "gameControls",
-  "displayName": "gameControls",
-  "description": "",
-  "publisher": "unknown",
+  "name": "asteroid-controls",
+  "displayName": "Asteroid Controls",
+  "description": "Controls James's silly asteroid game",
+  "publisher": "James Smith",
   "homepage": "",
-  "version": "0.0.0",
-  "license": "UNLICENSED",
+  "version": "0.1.0",
+  "license": "MIT",
   "main": "./dist/extension.js",
   "keywords": [],
   "scripts": {

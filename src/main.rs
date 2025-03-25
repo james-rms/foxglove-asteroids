@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use rapier2d::{na::Isometry, prelude::*};
@@ -9,9 +9,10 @@ use rapier2d::{na::Isometry, prelude::*};
 use foxglove::{
     schemas::{
         Color, CubePrimitive, FrameTransform, FrameTransforms, Log, ModelPrimitive, Pose,
-        Quaternion, SceneEntity, SceneEntityDeletion, SceneUpdate, TextPrimitive, Vector3,
+        Quaternion, SceneEntity, SceneEntityDeletion, SceneUpdate, TextPrimitive, Timestamp,
+        Vector3,
     },
-    websocket::{Capability, ClientId},
+    websocket::{Capability, Client, ClientId},
 };
 
 const WORLD_BOUND: f32 = 5.0;
@@ -40,6 +41,22 @@ fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet) 
     let body_handle = rigid_body_set.insert(rigid_body);
     collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
     body_handle
+}
+
+fn log(message: String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap();
+    let nanos = now.as_nanos();
+    let nsec = (nanos % 1_000_000_000) as u32;
+    let sec = (nanos / 1_000_000_000) as u32;
+    LOGS.log(&Log {
+        timestamp: Some(Timestamp::new(sec, nsec)),
+        level: 2,
+        name: "system".into(),
+        message,
+        ..Default::default()
+    })
 }
 
 #[derive(Default)]
@@ -256,7 +273,7 @@ impl AsteroidListener {
                             z: 0.25,
                         }),
                         // override_color: true,
-                        url: "file:///Users/j/ship.glb".into(),
+                        url: "package://ship.glb".into(),
                         ..Default::default()
                     }],
                     texts: vec![TextPrimitive {
@@ -359,18 +376,12 @@ impl AsteroidListener {
                     keys_pressed: 0,
                     body_handle,
                 });
-                LOGS.log(&Log {
-                    message: format!("Welcome {name}!"),
-                    ..Default::default()
-                });
+                log(format!("Welcome {name}"));
             }
             Entry::Occupied(mut entry) => {
                 if entry.get().name != name {
                     entry.get_mut().name = name.into();
-                    LOGS.log(&Log {
-                        message: format!("Welcome {name}!"),
-                        ..Default::default()
-                    });
+                    log(format!("Welcome {name}"));
                 }
             }
         }
@@ -410,10 +421,7 @@ impl AsteroidListener {
                 }],
                 entities: Vec::new(),
             });
-            LOGS.log(&Log {
-                message: format!("Goodbye {name}!"),
-                ..Default::default()
-            });
+            log(format!("Goodbye {name}!"));
         }
     }
 }
@@ -432,15 +440,26 @@ fn make_player_body_handle(
     body_handle
 }
 
+const SHIP: &[u8] = include_bytes!("ship.glb");
+
+async fn handle_assets(_client: Client, path: String) -> Result<bytes::Bytes, String> {
+    if path == "package://ship.glb" {
+        return Ok(SHIP.into());
+    } else {
+        return Err(format!("{path} not found"));
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let asteroids = Arc::new(AsteroidListener::new());
     let server = foxglove::WebSocketServer::new()
         .name("asteroid-server")
-        .bind("127.0.0.1", 9999)
+        .bind("0.0.0.0", 9999)
         .listener(asteroids.clone())
         .supported_encodings(["json"])
         .capabilities([Capability::ClientPublish])
+        .fetch_asset_handler_async_fn(handle_assets)
         .start()
         .await
         .expect("Failed to start visualization server");

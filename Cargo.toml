@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytes = "1.10.1"
 foxglove = "0.4.0"
 rand = "0.9.0"
 rapier2d = "0.23.1"
