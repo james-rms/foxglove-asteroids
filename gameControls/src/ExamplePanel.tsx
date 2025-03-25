@@ -110,11 +110,12 @@ function KeyListenPanel({
     if (context.advertise) {
       context.advertise("/keys", "number");
       context.advertise("/my-name-is", "string");
+      context.publish!("/my-name-is", nickname);
       setCanPublish(true);
     } else {
       setCanPublish(false);
     }
-  }, [context]);
+  }, [context, nickname]);
 
   // Set up keyboard event listeners
   useEffect(() => {
@@ -145,7 +146,6 @@ function KeyListenPanel({
     if (canPublish != undefined && canPublish) {
       const bitmap = toBitmap(pressedKeys);
       context.publish!("/keys", bitmap);
-      context.publish!("/my-name-is", nickname);
     }
   }, [canPublish, pressedKeys, context, nickname]);
 
