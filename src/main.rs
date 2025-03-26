@@ -194,29 +194,24 @@ impl foxglove::websocket::ServerListener for AsteroidListener {
         payload: &[u8],
     ) {
         let id = client.id();
-        let content: serde_json::Value = match serde_json::from_slice(payload) {
-            Ok(content) => content,
-            Err(err) => {
-                println!("client {id} sent invalid json: {err}");
-                return;
-            }
-        };
         if client_channel.topic == "/keys" {
-            let serde_json::Value::Number(n) = &content else {
-                println!("client {id} sent non-number JSON: {content:?}");
-                return;
+            let bitmap: u32 = match serde_json::from_slice(payload) {
+                Ok(bitmap) => bitmap,
+                Err(err) => {
+                    println!("client {id} sent non-number key bitmap: {err}");
+                    return;
+                }
             };
-            let Some(bitmap) = n.as_u64() else {
-                println!("client {id} sent non-integer keys: {content:?}");
-                return;
-            };
-            self.set_client_keys(id, bitmap as u32);
+            self.set_client_keys(id, bitmap);
         } else if client_channel.topic == "/my-name-is" {
-            let serde_json::Value::String(nickname) = &content else {
-                println!("client {id} sent non-string nickname: {content:?}");
-                return;
+            let nickname: String = match serde_json::from_slice(payload) {
+                Ok(nickname) => nickname,
+                Err(err) => {
+                    println!("client {id} sent non-string nickname: {err}");
+                    return;
+                }
             };
-            self.set_client_name(id, nickname);
+            self.set_client_name(id, &nickname);
         }
     }
 }
