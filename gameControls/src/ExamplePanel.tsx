@@ -1,4 +1,4 @@
-import { Immutable, MessageEvent, PanelExtensionContext, Topic } from "@foxglove/extension";
+import { PanelExtensionContext } from "@foxglove/extension";
 import React, { FormEvent, ReactElement, useEffect, useLayoutEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -31,19 +31,29 @@ function ParentPanel({ context }: { context: PanelExtensionContext }): ReactElem
   };
 
   return nickname == undefined ? (
-    <>
-      <form onSubmit={handleSubmit}>
-        <input
-          type="text"
-          placeholder="Enter your name"
-          value={inputValue}
-          onChange={(e) => {
-            setInputValue(e.target.value);
-          }}
-        />
-        <button type="submit">Submit</button>
-      </form>
-    </>
+    <div style={{ padding: "1rem" }}>
+      <div
+        style={{
+          marginTop: "1rem",
+          padding: "0.5rem",
+          border: "1px solid #ccc",
+          borderRadius: "4px",
+        }}
+      >
+        <h3>Welcome!</h3>
+        <form onSubmit={handleSubmit}>
+          <input
+            type="text"
+            placeholder="Enter your name"
+            value={inputValue}
+            onChange={(e) => {
+              setInputValue(e.target.value);
+            }}
+          />
+          <button type="submit">Submit</button>
+        </form>
+      </div>
+    </div>
   ) : (
     <KeyListenPanel context={context} nickname={nickname} />
   );
@@ -56,8 +66,6 @@ function KeyListenPanel({
   context: PanelExtensionContext;
   nickname: string;
 }): ReactElement {
-  const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
-  const [messages, setMessages] = useState<undefined | Immutable<MessageEvent[]>>();
   const [pressedKeys, setPressedKeys] = useState<PressedKeys>({
     a: false,
     w: false,
@@ -78,20 +86,13 @@ function KeyListenPanel({
     // Without a render handler your panel will never receive updates.
     //
     // The render handler could be invoked as often as 60hz during playback if fields are changing often.
-    context.onRender = (renderState, done) => {
+    context.onRender = (_, done) => {
       // render functions receive a _done_ callback. You MUST call this callback to indicate your panel has finished rendering.
       // Your panel will not receive another render callback until _done_ is called from a prior render. If your panel is not done
       // rendering before the next render call, studio shows a notification to the user that your panel is delayed.
       //
       // Set the done callback into a state variable to trigger a re-render.
       setRenderDone(() => done);
-
-      // We may have new topics - since we are also watching for messages in the current frame, topics may not have changed
-      // It is up to you to determine the correct action when state has not changed.
-      setTopics(renderState.topics);
-
-      // currentFrame has messages on subscribed topics since the last render call
-      setMessages(renderState.currentFrame);
     };
 
     // After adding a render handler, you must indicate which fields from RenderState will trigger updates.
@@ -164,7 +165,6 @@ function KeyListenPanel({
           borderRadius: "4px",
         }}
       >
-        {canPublish != undefined && canPublish ? "can publish" : "cannot publish"}
         <h3>Keyboard Input</h3>
         <p>
           pressed keys:{" "}
@@ -178,28 +178,9 @@ function KeyListenPanel({
           </strong>
         </p>
         <p>
-          <em>Press W, A, S, D, or space to see it displayed here</em>
+          <em>WASD to move, space to shoot. Destroy all of the rocks. Good luck!</em>
         </p>
       </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "1fr 1fr",
-          rowGap: "0.2rem",
-          marginTop: "1rem",
-        }}
-      >
-        <b style={{ borderBottom: "1px solid" }}>Topic</b>
-        <b style={{ borderBottom: "1px solid" }}>Schema name</b>
-        {(topics ?? []).map((topic) => (
-          <>
-            <div key={topic.name}>{topic.name}</div>
-            <div key={topic.schemaName}>{topic.schemaName}</div>
-          </>
-        ))}
-      </div>
-      <div>{messages?.length}</div>
     </div>
   );
 }

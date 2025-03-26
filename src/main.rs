@@ -26,6 +26,7 @@ struct AsteroidListener {
 struct Player {
     name: String,
     keys_pressed: u32,
+    last_seen: u64,
     state: PlayerState,
 }
 
@@ -180,7 +181,10 @@ impl foxglove::websocket::ServerListener for AsteroidListener {
         client: foxglove::websocket::Client,
         _channel: &foxglove::websocket::ClientChannel,
     ) {
-        self.remove_client(client.id());
+        let mut state = self.asteroids.lock().unwrap();
+        let asteroids = &mut *state;
+        let client_id: u32 = client.id().into();
+        remove_player(asteroids, client_id);
     }
 
     fn on_message_data(
@@ -241,6 +245,7 @@ const PLAYER_INIT_HEALTH: u32 = 10;
 const SCENE_ENTITY_PUBLISH_PERIOD: u64 = 100;
 const FIRE_PERIOD: u64 = 10;
 const RESURRECTION_TICKS: u64 = 500;
+const INACTIVE_KICK_TICKS: u64 = 2000;
 
 fn wrap_pos(body: &mut RigidBody) {
     let mut pos = *body.translation();
@@ -357,6 +362,20 @@ fn rock_player_collision(
         );
     };
 }
+fn remove_player(asteroids: &mut Asteroids, client_id: u32) {
+    if let Some(client) = asteroids.clients.remove(&client_id) {
+        let name = client.name;
+        BOXES.log(&SceneUpdate {
+            deletions: vec![SceneEntityDeletion {
+                timestamp: None,
+                r#type: foxglove::schemas::scene_entity_deletion::Type::MatchingId.into(),
+                id: format!("player_{client_id}"),
+            }],
+            entities: Vec::new(),
+        });
+        log(format!("Goodbye {name}!"));
+    }
+}
 
 fn shoot(
     tick: u64,
@@ -439,6 +458,24 @@ impl AsteroidListener {
     fn tick(&self) {
         let mut state = self.asteroids.lock().unwrap();
         let asteroids = &mut *state;
+
+        let dead_player_ids: Vec<(u32, String)> = asteroids
+            .clients
+            .iter()
+            .filter_map(|(id, player)| {
+                if player.last_seen + INACTIVE_KICK_TICKS < asteroids.tick_number {
+                    Some((*id, player.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (id, name) in dead_player_ids {
+            log(format!("removing {name} due to inactivity"));
+            remove_player(asteroids, id);
+        }
+
         for (id, player) in asteroids.clients.iter_mut() {
             match &mut player.state {
                 PlayerState::Alive {
@@ -939,6 +976,7 @@ impl AsteroidListener {
                 vacant.insert(Player {
                     name: name.into(),
                     keys_pressed: 0,
+                    last_seen: asteroids.tick_number,
                     state: PlayerState::Alive {
                         handle,
                         health: PLAYER_INIT_HEALTH,
@@ -948,10 +986,12 @@ impl AsteroidListener {
                 log(format!("Welcome {name}"));
             }
             Entry::Occupied(mut entry) => {
-                if entry.get().name != name {
-                    entry.get_mut().name = name.into();
+                let player = entry.get_mut();
+                if player.name != name {
+                    player.name = name.into();
                     log(format!("Welcome {name}"));
                 }
+                player.last_seen = asteroids.tick_number;
             }
         }
     }
@@ -968,6 +1008,7 @@ impl AsteroidListener {
                 vacant.insert(Player {
                     name: "(nameless)".into(),
                     keys_pressed: keys,
+                    last_seen: asteroids.tick_number,
                     state: PlayerState::Alive {
                         handle,
                         health: PLAYER_INIT_HEALTH,
@@ -976,25 +1017,10 @@ impl AsteroidListener {
                 });
             }
             Entry::Occupied(mut entry) => {
-                entry.get_mut().keys_pressed = keys;
+                let player = entry.get_mut();
+                player.keys_pressed = keys;
+                player.last_seen = asteroids.tick_number;
             }
-        }
-    }
-    fn remove_client(&self, client_id: ClientId) {
-        let mut state = self.asteroids.lock().unwrap();
-        let asteroids = &mut *state;
-        let client_id: u32 = client_id.into();
-        if let Some(client) = asteroids.clients.remove(&client_id) {
-            let name = client.name;
-            BOXES.log(&SceneUpdate {
-                deletions: vec![SceneEntityDeletion {
-                    timestamp: None,
-                    r#type: foxglove::schemas::scene_entity_deletion::Type::MatchingId.into(),
-                    id: format!("player_{client_id}"),
-                }],
-                entities: Vec::new(),
-            });
-            log(format!("Goodbye {name}!"));
         }
     }
 }
@@ -1038,7 +1064,7 @@ async fn main() {
     let asteroids = Arc::new(AsteroidListener::new());
     let server = foxglove::WebSocketServer::new()
         .name("asteroid-server")
-        .bind("0.0.0.0", 9999)
+        .bind("127.0.0.1", 9999)
         .listener(asteroids.clone())
         .supported_encodings(["json"])
         .capabilities([Capability::ClientPublish])
@@ -1046,7 +1072,7 @@ async fn main() {
         .start()
         .await
         .expect("Failed to start visualization server");
-    println!("server started on localhost:9999");
+    println!("server started on 127.0.0.1:9999");
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     loop {
         tokio::select! {
