@@ -39,6 +39,41 @@ enum PlayerState {
     },
 }
 
+#[derive(Clone, Copy)]
+enum EntityType {
+    Rock,
+    Player,
+    Bullet,
+}
+
+#[derive(Clone, Copy)]
+struct BodyUserData {
+    what: EntityType,
+    id: u32,
+}
+
+impl BodyUserData {
+    fn pack(self) -> u128 {
+        let discriminant = match self.what {
+            EntityType::Rock => 1,
+            EntityType::Player => 2,
+            EntityType::Bullet => 3,
+        };
+        (discriminant << 32) + (self.id as u128)
+    }
+    fn unpack(packed: u128) -> Self {
+        let discriminant = packed >> 32;
+        let id = (packed & ((1 << 32) - 1)) as u32;
+        let what = match discriminant {
+            1 => EntityType::Rock,
+            2 => EntityType::Player,
+            3 => EntityType::Bullet,
+            _ => panic!("expected valid discriminant, got {discriminant}"),
+        };
+        Self { id, what }
+    }
+}
+
 struct Bullet {
     handle: Option<RigidBodyHandle>,
     born_tick: u64,
@@ -56,18 +91,35 @@ enum Rock {
     },
 }
 
-fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet) -> RigidBodyHandle {
+fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet, id: u32) -> Rock {
     let x = rand::random_range(-WORLD_BOUND..WORLD_BOUND);
     let y = rand::random_range(-WORLD_BOUND..WORLD_BOUND);
     let rigid_body = RigidBodyBuilder::dynamic()
         .translation(vector![x, y])
+        .angvel(rand::random_range(0.0..10.0))
+        .linvel(Vector::new(
+            rand::random_range(-2.0..2.0),
+            rand::random_range(-2.0..2.0),
+        ))
         .angular_damping(ROT_DAMP)
         .rotation(rand::random_range(0.0..10.0))
+        .user_data(
+            BodyUserData {
+                id,
+                what: EntityType::Rock,
+            }
+            .pack(),
+        )
         .build();
-    let collider = ColliderBuilder::cuboid(0.25, 0.25).build();
-    let body_handle = rigid_body_set.insert(rigid_body);
-    collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
-    body_handle
+    let collider = ColliderBuilder::cuboid(0.25, 0.25)
+        .active_events(ActiveEvents::COLLISION_EVENTS)
+        .build();
+    let handle = rigid_body_set.insert(rigid_body);
+    collider_set.insert_with_parent(collider, handle, rigid_body_set);
+    Rock::Alive {
+        handle,
+        health: ROCK_INIT_HEALTH,
+    }
 }
 
 fn log(message: String) {
@@ -84,7 +136,7 @@ fn log(message: String) {
 struct Asteroids {
     clients: BTreeMap<u32, Player>,
     gravity: Vector<f32>,
-    rocks: Vec<RigidBodyHandle>,
+    rocks: Vec<Rock>,
     bullets: Vec<Bullet>,
     next_bullet_idx: usize,
     integration_parameters: IntegrationParameters,
@@ -116,29 +168,27 @@ impl foxglove::websocket::ServerListener for AsteroidListener {
         payload: &[u8],
     ) {
         let id = client.id();
+        let content: serde_json::Value = match serde_json::from_slice(payload) {
+            Ok(content) => content,
+            Err(err) => {
+                println!("client {id} sent invalid json: {err}");
+                return;
+            }
+        };
         if client_channel.topic == "/keys" {
-            let stringnum = match std::str::from_utf8(payload) {
-                Ok(n) => n,
-                Err(err) => {
-                    println!("client {id} sent non-utf8-formatted json: {err}");
-                    return;
-                }
+            let serde_json::Value::Number(n) = &content else {
+                println!("client {id} sent non-number JSON: {content:?}");
+                return;
             };
-            let bitmap: u32 = match stringnum.parse() {
-                Ok(n) => n,
-                Err(err) => {
-                    println!("client {id} sent JSON other than a number: {err}");
-                    return;
-                }
+            let Some(bitmap) = n.as_u64() else {
+                println!("client {id} sent non-integer keys: {content:?}");
+                return;
             };
-            self.set_client_keys(id, bitmap);
+            self.set_client_keys(id, bitmap as u32);
         } else if client_channel.topic == "/my-name-is" {
-            let nickname = match std::str::from_utf8(payload) {
-                Ok(name) => name,
-                Err(err) => {
-                    println!("client {id} sent non-utf8-formatted json: {err}");
-                    return;
-                }
+            let serde_json::Value::String(nickname) = &content else {
+                println!("client {id} sent non-string nickname: {content:?}");
+                return;
             };
             self.set_client_name(id, nickname);
         }
@@ -161,10 +211,13 @@ const ROT_SPEED: f32 = 0.005;
 const ACCEL: f32 = 0.025;
 const ROT_DAMP: f32 = 5.0;
 const BRAKE: f32 = 5.0;
+const ROCK_INIT_HEALTH: u32 = 5;
+const NUM_ROCKS: u32 = 10;
+const PLAYER_INIT_HEALTH: u32 = 10;
 
 const SCENE_ENTITY_PBLISH_PERIOD: u64 = 100;
-const TRANSFORM_PUBLISH_PERIOD: u64 = 10;
-const FIRE_PERIOD: u64 = 5;
+const FIRE_PERIOD: u64 = 10;
+const RESURRECTION_TICKS: u64 = 500;
 
 fn wrap_pos(body: &mut RigidBody) {
     let mut pos = *body.translation();
@@ -198,6 +251,82 @@ fn wrap_pos(body: &mut RigidBody) {
     }
 }
 
+fn ding_rock(rock: &mut Rock, rigid_body_set: &RigidBodySet, tick: u64) -> Option<RigidBodyHandle> {
+    let res = match rock {
+        Rock::Alive { handle, health: 0 } => {
+            log(format!("rock destroyed"));
+            let body = &rigid_body_set[*handle];
+            let pos = body.translation();
+            Some((pos.x, pos.y, *handle))
+        }
+        Rock::Alive { health, .. } => {
+            *health -= 1;
+            None
+        }
+        Rock::Dead { .. } => None,
+    };
+    if let Some((x, y, handle)) = res {
+        *rock = Rock::Dead { tick, x, y };
+        Some(handle)
+    } else {
+        None
+    }
+}
+
+fn ding_player(player: &mut Player, tick: u64) -> Option<RigidBodyHandle> {
+    let res = match &mut player.state {
+        PlayerState::Alive {
+            health: 0, handle, ..
+        } => {
+            log(format!("{} died, will resurrect in 5 seconds", player.name));
+            Some(*handle)
+        }
+        PlayerState::Alive { health, .. } => {
+            *health -= 1;
+            log(format!("{} down to {health} health", player.name));
+            None
+        }
+        PlayerState::Dead { .. } => None,
+    };
+    if res.is_some() {
+        player.state = PlayerState::Dead { tick };
+    }
+    res
+}
+
+fn rock_player_collision(
+    player: &mut Player,
+    rock: &mut Rock,
+    island_manager: &mut IslandManager,
+    collider_set: &mut ColliderSet,
+    rigid_body_set: &mut RigidBodySet,
+    impulse_joint_set: &mut ImpulseJointSet,
+    multibody_joint_set: &mut MultibodyJointSet,
+    tick: u64,
+) {
+    log(format!("{} hit a rock", player.name));
+    if let Some(handle) = ding_player(player, tick) {
+        rigid_body_set.remove(
+            handle,
+            island_manager,
+            collider_set,
+            impulse_joint_set,
+            multibody_joint_set,
+            true,
+        );
+    };
+    if let Some(handle) = ding_rock(rock, &rigid_body_set, tick) {
+        rigid_body_set.remove(
+            handle,
+            island_manager,
+            collider_set,
+            impulse_joint_set,
+            multibody_joint_set,
+            true,
+        );
+    };
+}
+
 fn shoot(
     tick: u64,
     bullets: &mut Vec<Bullet>,
@@ -219,8 +348,17 @@ fn shoot(
             my_rot.re * BULLET_SPEED,
             my_rot.im * BULLET_SPEED,
         ))
+        .user_data(
+            BodyUserData {
+                id: *next_bullet_idx as u32,
+                what: EntityType::Bullet,
+            }
+            .pack(),
+        )
         .build();
-    let collider = ColliderBuilder::ball(0.1).build();
+    let collider = ColliderBuilder::ball(0.1)
+        .active_events(ActiveEvents::COLLISION_EVENTS)
+        .build();
     let body_handle = rigid_body_set.insert(rigid_body);
     collider_set.insert_with_parent(collider, body_handle, rigid_body_set);
     let bullet = &mut bullets[*next_bullet_idx];
@@ -236,8 +374,8 @@ impl AsteroidListener {
         let mut rigid_body_set = RigidBodySet::new();
         let mut rocks = Vec::with_capacity(10);
         let mut bullets = Vec::with_capacity(000);
-        for _ in 0..10 {
-            rocks.push(make_rock(&mut collider_set, &mut rigid_body_set));
+        for idx in 0..NUM_ROCKS {
+            rocks.push(make_rock(&mut collider_set, &mut rigid_body_set, idx));
         }
         for _ in 0..100 {
             bullets.push(Bullet {
@@ -268,10 +406,9 @@ impl AsteroidListener {
     }
 
     fn tick(&self) {
-        // always forward-calculate the physics
         let mut state = self.asteroids.lock().unwrap();
         let asteroids = &mut *state;
-        for (_, player) in asteroids.clients.iter_mut() {
+        for (id, player) in asteroids.clients.iter_mut() {
             match &mut player.state {
                 PlayerState::Alive {
                     handle,
@@ -313,14 +450,51 @@ impl AsteroidListener {
                     }
                 }
                 PlayerState::Dead { tick } => {
-                    // TODO resurrect after a few ticks
+                    if asteroids.tick_number > *tick + RESURRECTION_TICKS {
+                        log(format!("{} is resurrected!", player.name));
+                        player.state = PlayerState::Alive {
+                            handle: make_player_body_handle(
+                                &mut asteroids.collider_set,
+                                &mut asteroids.rigid_body_set,
+                                *id,
+                            ),
+                            health: PLAYER_INIT_HEALTH,
+                            last_shot_tick: None,
+                        }
+                    }
                 }
             }
         }
 
-        for handle in asteroids.rocks.iter() {
-            let body = &mut asteroids.rigid_body_set[*handle];
-            wrap_pos(body);
+        for rock in asteroids.rocks.iter() {
+            if let Rock::Alive { handle, .. } = rock {
+                let body = &mut asteroids.rigid_body_set[*handle];
+                wrap_pos(body);
+            }
+        }
+        if asteroids
+            .rocks
+            .iter()
+            .filter(|&r| matches!(r, Rock::Alive { .. }))
+            .count()
+            == 0
+        {
+            log("All rocks destroyed, well done everybody!".into());
+            log("New game starts now!".into());
+            asteroids.rocks.clear();
+            for id in 0..NUM_ROCKS {
+                asteroids.rocks.push(make_rock(
+                    &mut asteroids.collider_set,
+                    &mut asteroids.rigid_body_set,
+                    id,
+                ));
+            }
+        }
+        for rock in asteroids.rocks.iter() {
+            if let Rock::Alive { handle, .. } = rock {
+                let body = &mut asteroids.rigid_body_set[*handle];
+                wrap_pos(body);
+            }
         }
 
         for bullet in asteroids.bullets.iter_mut() {
@@ -361,28 +535,149 @@ impl AsteroidListener {
         );
         while let Ok(collision_event) = collision_recv.try_recv() {
             // Handle the collision event.
-            let Some(handle1) = asteroids
+            let Some(entity1) = asteroids
                 .collider_set
                 .get(collision_event.collider1())
                 .map(|collider| collider.parent())
                 .flatten()
+                .map(|handle| BodyUserData::unpack(asteroids.rigid_body_set[handle].user_data))
             else {
                 continue;
             };
-            let Some(handle2) = asteroids
+            let Some(entity2) = asteroids
                 .collider_set
                 .get(collision_event.collider2())
                 .map(|collider| collider.parent())
                 .flatten()
+                .map(|handle| BodyUserData::unpack(asteroids.rigid_body_set[handle].user_data))
             else {
                 continue;
             };
-            for player in asteroids.clients.values() {
-                if let PlayerState::Alive { handle, .. } = player.state {
-                    if handle == handle1 || handle == handle2 {
-                        let name = &player.name;
-                        log(format!("{name} bonked!"));
+            match (entity1.what, entity2.what) {
+                (EntityType::Rock, EntityType::Rock) => {}
+                (EntityType::Bullet, EntityType::Bullet) => {}
+                (EntityType::Player, EntityType::Rock) => {
+                    let Some(player) = asteroids.clients.get_mut(&entity1.id) else {
+                        continue;
+                    };
+                    let rock = &mut asteroids.rocks[entity2.id as usize];
+                    rock_player_collision(
+                        player,
+                        rock,
+                        &mut asteroids.island_manager,
+                        &mut asteroids.collider_set,
+                        &mut asteroids.rigid_body_set,
+                        &mut asteroids.impulse_joint_set,
+                        &mut asteroids.multibody_joint_set,
+                        asteroids.tick_number,
+                    );
+                }
+                (EntityType::Rock, EntityType::Player) => {
+                    let rock = &mut asteroids.rocks[entity1.id as usize];
+                    let Some(player) = asteroids.clients.get_mut(&entity2.id) else {
+                        continue;
+                    };
+                    rock_player_collision(
+                        player,
+                        rock,
+                        &mut asteroids.island_manager,
+                        &mut asteroids.collider_set,
+                        &mut asteroids.rigid_body_set,
+                        &mut asteroids.impulse_joint_set,
+                        &mut asteroids.multibody_joint_set,
+                        asteroids.tick_number,
+                    );
+                }
+                (EntityType::Player, EntityType::Player) => {
+                    let Some(player) = asteroids.clients.get_mut(&entity1.id) else {
+                        continue;
+                    };
+                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                        asteroids.rigid_body_set.remove(
+                            handle,
+                            &mut asteroids.island_manager,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.impulse_joint_set,
+                            &mut asteroids.multibody_joint_set,
+                            true,
+                        );
                     }
+                    let Some(player) = asteroids.clients.get_mut(&entity2.id) else {
+                        continue;
+                    };
+                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                        asteroids.rigid_body_set.remove(
+                            handle,
+                            &mut asteroids.island_manager,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.impulse_joint_set,
+                            &mut asteroids.multibody_joint_set,
+                            true,
+                        );
+                    }
+                }
+                (EntityType::Player, EntityType::Bullet) => {
+                    let Some(player) = asteroids.clients.get_mut(&entity1.id) else {
+                        continue;
+                    };
+                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                        asteroids.rigid_body_set.remove(
+                            handle,
+                            &mut asteroids.island_manager,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.impulse_joint_set,
+                            &mut asteroids.multibody_joint_set,
+                            true,
+                        );
+                    }
+                }
+                (EntityType::Bullet, EntityType::Player) => {
+                    let Some(player) = asteroids.clients.get_mut(&entity2.id) else {
+                        continue;
+                    };
+                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                        asteroids.rigid_body_set.remove(
+                            handle,
+                            &mut asteroids.island_manager,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.impulse_joint_set,
+                            &mut asteroids.multibody_joint_set,
+                            true,
+                        );
+                    }
+                }
+                (EntityType::Rock, EntityType::Bullet) => {
+                    if let Some(handle) = ding_rock(
+                        &mut asteroids.rocks[entity1.id as usize],
+                        &asteroids.rigid_body_set,
+                        asteroids.tick_number,
+                    ) {
+                        asteroids.rigid_body_set.remove(
+                            handle,
+                            &mut asteroids.island_manager,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.impulse_joint_set,
+                            &mut asteroids.multibody_joint_set,
+                            true,
+                        );
+                    }
+                }
+                (EntityType::Bullet, EntityType::Rock) => {
+                    if let Some(handle) = ding_rock(
+                        &mut asteroids.rocks[entity2.id as usize],
+                        &asteroids.rigid_body_set,
+                        asteroids.tick_number,
+                    ) {
+                        asteroids.rigid_body_set.remove(
+                            handle,
+                            &mut asteroids.island_manager,
+                            &mut asteroids.collider_set,
+                            &mut asteroids.impulse_joint_set,
+                            &mut asteroids.multibody_joint_set,
+                            true,
+                        );
+                    }
+                    // ditto
                 }
             }
         }
@@ -428,10 +723,10 @@ impl AsteroidListener {
                     ..Default::default()
                 });
             }
-            for handle in asteroids.rocks.iter() {
+            for (idx, _) in asteroids.rocks.iter().enumerate() {
                 entities.push(SceneEntity {
-                    id: format!("rock_{handle:?}"),
-                    frame_id: format!("rock_{handle:?}"),
+                    id: format!("rock_{idx}"),
+                    frame_id: format!("rock_{idx}"),
                     cubes: vec![CubePrimitive {
                         pose: None,
                         size: Some(Vector3 {
@@ -505,23 +800,29 @@ impl AsteroidListener {
                 ..Default::default()
             })
         }
-        for handle in asteroids.rocks.iter() {
-            let body = &asteroids.rigid_body_set[*handle];
-            let pos = body.translation();
-            let angle = body.rotation().angle() / 2.0;
+        for (idx, rock) in asteroids.rocks.iter().enumerate() {
+            let (x, y, qz, qw) = match rock {
+                Rock::Alive { handle, .. } => {
+                    let body = &asteroids.rigid_body_set[*handle];
+                    let pos = body.translation();
+                    let angle = body.rotation().angle() / 2.0;
+                    (pos.x, pos.y, angle.sin(), angle.cos())
+                }
+                Rock::Dead { .. } => (9999.0, 9999.0, 1.0, 0.0),
+            };
             transforms.push(FrameTransform {
                 parent_frame_id: "world".into(),
-                child_frame_id: format!("rock_{handle:?}"),
+                child_frame_id: format!("rock_{idx}"),
                 translation: Some(Vector3 {
-                    x: pos.x as _,
-                    y: pos.y as _,
+                    x: x as _,
+                    y: y as _,
                     z: 0.0,
                 }),
                 rotation: Some(Quaternion {
                     x: 0.,
                     y: 0.,
-                    z: angle.sin() as _,
-                    w: angle.cos() as _, // real component
+                    z: qz as _,
+                    w: qw as _, // real component
                 }),
                 ..Default::default()
             });
@@ -559,13 +860,13 @@ impl AsteroidListener {
 
         match clients.entry(client_id.into()) {
             Entry::Vacant(vacant) => {
-                let handle = make_player_body_handle(collider_set, rigid_body_set);
+                let handle = make_player_body_handle(collider_set, rigid_body_set, *vacant.key());
                 vacant.insert(Player {
                     name: name.into(),
                     keys_pressed: 0,
                     state: PlayerState::Alive {
                         handle,
-                        health: 10,
+                        health: PLAYER_INIT_HEALTH,
                         last_shot_tick: None,
                     },
                 });
@@ -588,13 +889,13 @@ impl AsteroidListener {
 
         match clients.entry(client_id.into()) {
             Entry::Vacant(vacant) => {
-                let handle = make_player_body_handle(collider_set, rigid_body_set);
+                let handle = make_player_body_handle(collider_set, rigid_body_set, *vacant.key());
                 vacant.insert(Player {
                     name: "(nameless)".into(),
                     keys_pressed: keys,
                     state: PlayerState::Alive {
                         handle,
-                        health: 10,
+                        health: PLAYER_INIT_HEALTH,
                         last_shot_tick: None,
                     },
                 });
@@ -626,10 +927,18 @@ impl AsteroidListener {
 fn make_player_body_handle(
     collider_set: &mut ColliderSet,
     rigid_body_set: &mut RigidBodySet,
+    id: u32,
 ) -> RigidBodyHandle {
     let rigid_body = RigidBodyBuilder::dynamic()
         .translation(vector![0.0, 0.0])
         .angular_damping(ROT_DAMP)
+        .user_data(
+            BodyUserData {
+                id,
+                what: EntityType::Player,
+            }
+            .pack(),
+        )
         .build();
     let collider = ColliderBuilder::cuboid(0.25, 0.25)
         .active_events(ActiveEvents::COLLISION_EVENTS)

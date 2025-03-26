@@ -568,6 +568,7 @@ dependencies = [
  "foxglove",
  "rand",
  "rapier2d",
+ "serde_json",
  "tokio",
 ]
 

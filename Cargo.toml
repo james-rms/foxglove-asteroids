@@ -9,4 +9,5 @@ crossbeam = "0.8.4"
 foxglove = "0.4.0"
 rand = "0.9.0"
 rapier2d = "0.23.1"
+serde_json = { version = "1.0.140", features = ["alloc"] }
 tokio = { version = "1.44.1", features = ["full"] }
