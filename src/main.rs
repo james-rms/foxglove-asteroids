@@ -1,3 +1,4 @@
+use core::f32;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::{Arc, Mutex},
@@ -8,9 +9,9 @@ use rapier2d::{na::Isometry, prelude::*};
 
 use foxglove::{
     schemas::{
-        Color, CubePrimitive, FrameTransform, FrameTransforms, Log, ModelPrimitive, Pose,
-        Quaternion, SceneEntity, SceneEntityDeletion, SceneUpdate, SpherePrimitive, TextPrimitive,
-        Timestamp, Vector3,
+        Color, CubePrimitive, FrameTransform, FrameTransforms, Log, ModelPrimitive,
+        PackedElementField, PointCloud, Pose, Quaternion, SceneEntity, SceneEntityDeletion,
+        SceneUpdate, SpherePrimitive, TextPrimitive, Timestamp, Vector3,
     },
     websocket::{Capability, Client, ClientId},
 };
@@ -36,6 +37,8 @@ enum PlayerState {
     },
     Dead {
         tick: u64,
+        x: f32,
+        y: f32,
     },
 }
 
@@ -89,6 +92,25 @@ enum Rock {
         x: f32,
         y: f32,
     },
+}
+
+fn draw_death_rings(point_storage: &mut Vec<u8>, tick_delta: u64, x: f32, y: f32) {
+    // want radius = 3.0 when tick_delta = 100
+    if tick_delta > 100 {
+        return;
+    }
+    let radius = (tick_delta as f32) * (0.03);
+    for t in 0..16 {
+        let theta = (f32::consts::PI / 8.0) * t as f32;
+        let dx = theta.cos() * radius;
+        let dy = theta.sin() * radius;
+        let x = x + dx;
+        let y = y + dy;
+        let z: f32 = 0.0;
+        point_storage.extend_from_slice(&x.to_le_bytes());
+        point_storage.extend_from_slice(&y.to_le_bytes());
+        point_storage.extend_from_slice(&z.to_le_bytes());
+    }
 }
 
 fn make_rock(collider_set: &mut ColliderSet, rigid_body_set: &mut RigidBodySet, id: u32) -> Rock {
@@ -198,6 +220,7 @@ impl foxglove::websocket::ServerListener for AsteroidListener {
 foxglove::static_typed_channel!(BOXES, "/scene", foxglove::schemas::SceneUpdate);
 foxglove::static_typed_channel!(TF, "/tf", foxglove::schemas::FrameTransforms);
 foxglove::static_typed_channel!(LOGS, "/logs", foxglove::schemas::Log);
+foxglove::static_typed_channel!(POINTCLOUD, "/pointcloud", foxglove::schemas::PointCloud);
 
 const UP: u32 = 1;
 const LEFT: u32 = 2;
@@ -215,7 +238,7 @@ const ROCK_INIT_HEALTH: u32 = 5;
 const NUM_ROCKS: u32 = 10;
 const PLAYER_INIT_HEALTH: u32 = 10;
 
-const SCENE_ENTITY_PBLISH_PERIOD: u64 = 100;
+const SCENE_ENTITY_PUBLISH_PERIOD: u64 = 100;
 const FIRE_PERIOD: u64 = 10;
 const RESURRECTION_TICKS: u64 = 500;
 
@@ -254,7 +277,6 @@ fn wrap_pos(body: &mut RigidBody) {
 fn ding_rock(rock: &mut Rock, rigid_body_set: &RigidBodySet, tick: u64) -> Option<RigidBodyHandle> {
     let res = match rock {
         Rock::Alive { handle, health: 0 } => {
-            log(format!("rock destroyed"));
             let body = &rigid_body_set[*handle];
             let pos = body.translation();
             Some((pos.x, pos.y, *handle))
@@ -273,13 +295,19 @@ fn ding_rock(rock: &mut Rock, rigid_body_set: &RigidBodySet, tick: u64) -> Optio
     }
 }
 
-fn ding_player(player: &mut Player, tick: u64) -> Option<RigidBodyHandle> {
+fn ding_player(
+    player: &mut Player,
+    rigid_body_set: &mut RigidBodySet,
+    tick: u64,
+) -> Option<RigidBodyHandle> {
     let res = match &mut player.state {
         PlayerState::Alive {
             health: 0, handle, ..
         } => {
             log(format!("{} died, will resurrect in 5 seconds", player.name));
-            Some(*handle)
+            let body = &rigid_body_set[*handle];
+            let pos = body.translation();
+            Some((pos.x, pos.y, *handle))
         }
         PlayerState::Alive { health, .. } => {
             *health -= 1;
@@ -288,12 +316,15 @@ fn ding_player(player: &mut Player, tick: u64) -> Option<RigidBodyHandle> {
         }
         PlayerState::Dead { .. } => None,
     };
-    if res.is_some() {
-        player.state = PlayerState::Dead { tick };
+    if let Some((x, y, handle)) = res {
+        player.state = PlayerState::Dead { tick, x, y };
+        Some(handle)
+    } else {
+        None
     }
-    res
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rock_player_collision(
     player: &mut Player,
     rock: &mut Rock,
@@ -305,7 +336,7 @@ fn rock_player_collision(
     tick: u64,
 ) {
     log(format!("{} hit a rock", player.name));
-    if let Some(handle) = ding_player(player, tick) {
+    if let Some(handle) = ding_player(player, rigid_body_set, tick) {
         rigid_body_set.remove(
             handle,
             island_manager,
@@ -315,7 +346,7 @@ fn rock_player_collision(
             true,
         );
     };
-    if let Some(handle) = ding_rock(rock, &rigid_body_set, tick) {
+    if let Some(handle) = ding_rock(rock, rigid_body_set, tick) {
         rigid_body_set.remove(
             handle,
             island_manager,
@@ -329,7 +360,7 @@ fn rock_player_collision(
 
 fn shoot(
     tick: u64,
-    bullets: &mut Vec<Bullet>,
+    bullets: &mut [Bullet],
     next_bullet_idx: &mut usize,
     collider_set: &mut ColliderSet,
     rigid_body_set: &mut RigidBodySet,
@@ -449,7 +480,7 @@ impl AsteroidListener {
                         }
                     }
                 }
-                PlayerState::Dead { tick } => {
+                PlayerState::Dead { tick, .. } => {
                     if asteroids.tick_number > *tick + RESURRECTION_TICKS {
                         log(format!("{} is resurrected!", player.name));
                         player.state = PlayerState::Alive {
@@ -520,7 +551,7 @@ impl AsteroidListener {
 
         asteroids.physics_pipeline.step(
             &asteroids.gravity,
-            &mut asteroids.integration_parameters,
+            &asteroids.integration_parameters,
             &mut asteroids.island_manager,
             &mut asteroids.broad_phase,
             &mut asteroids.narrow_phase,
@@ -538,8 +569,7 @@ impl AsteroidListener {
             let Some(entity1) = asteroids
                 .collider_set
                 .get(collision_event.collider1())
-                .map(|collider| collider.parent())
-                .flatten()
+                .and_then(|collider| collider.parent())
                 .map(|handle| BodyUserData::unpack(asteroids.rigid_body_set[handle].user_data))
             else {
                 continue;
@@ -547,8 +577,7 @@ impl AsteroidListener {
             let Some(entity2) = asteroids
                 .collider_set
                 .get(collision_event.collider2())
-                .map(|collider| collider.parent())
-                .flatten()
+                .and_then(|collider| collider.parent())
                 .map(|handle| BodyUserData::unpack(asteroids.rigid_body_set[handle].user_data))
             else {
                 continue;
@@ -592,7 +621,9 @@ impl AsteroidListener {
                     let Some(player) = asteroids.clients.get_mut(&entity1.id) else {
                         continue;
                     };
-                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                    if let Some(handle) =
+                        ding_player(player, &mut asteroids.rigid_body_set, asteroids.tick_number)
+                    {
                         asteroids.rigid_body_set.remove(
                             handle,
                             &mut asteroids.island_manager,
@@ -605,7 +636,9 @@ impl AsteroidListener {
                     let Some(player) = asteroids.clients.get_mut(&entity2.id) else {
                         continue;
                     };
-                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                    if let Some(handle) =
+                        ding_player(player, &mut asteroids.rigid_body_set, asteroids.tick_number)
+                    {
                         asteroids.rigid_body_set.remove(
                             handle,
                             &mut asteroids.island_manager,
@@ -620,7 +653,9 @@ impl AsteroidListener {
                     let Some(player) = asteroids.clients.get_mut(&entity1.id) else {
                         continue;
                     };
-                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                    if let Some(handle) =
+                        ding_player(player, &mut asteroids.rigid_body_set, asteroids.tick_number)
+                    {
                         asteroids.rigid_body_set.remove(
                             handle,
                             &mut asteroids.island_manager,
@@ -635,7 +670,9 @@ impl AsteroidListener {
                     let Some(player) = asteroids.clients.get_mut(&entity2.id) else {
                         continue;
                     };
-                    if let Some(handle) = ding_player(player, asteroids.tick_number) {
+                    if let Some(handle) =
+                        ding_player(player, &mut asteroids.rigid_body_set, asteroids.tick_number)
+                    {
                         asteroids.rigid_body_set.remove(
                             handle,
                             &mut asteroids.island_manager,
@@ -682,7 +719,7 @@ impl AsteroidListener {
             }
         }
 
-        if asteroids.tick_number % SCENE_ENTITY_PBLISH_PERIOD == 0 {
+        if asteroids.tick_number % SCENE_ENTITY_PUBLISH_PERIOD == 0 {
             let mut entities = Vec::new();
 
             for (id, client) in asteroids.clients.iter() {
@@ -770,6 +807,44 @@ impl AsteroidListener {
                 entities,
             });
         }
+
+        let mut pointcloud_storage = Vec::new();
+        for player in asteroids.clients.values() {
+            if let PlayerState::Dead { tick, x, y } = &player.state {
+                let tick_delta = asteroids.tick_number - *tick;
+                draw_death_rings(&mut pointcloud_storage, tick_delta, *x, *y);
+            }
+        }
+        for rock in asteroids.rocks.iter() {
+            if let Rock::Dead { tick, x, y } = rock {
+                let tick_delta = asteroids.tick_number - *tick;
+                draw_death_rings(&mut pointcloud_storage, tick_delta, *x, *y);
+            }
+        }
+        POINTCLOUD.log(&PointCloud {
+            timestamp: Some(Timestamp::try_from(std::time::SystemTime::now()).unwrap()),
+            frame_id: "world".into(),
+            point_stride: 12,
+            fields: vec![
+                PackedElementField {
+                    name: "x".into(),
+                    offset: 0,
+                    r#type: foxglove::schemas::packed_element_field::NumericType::Float32.into(),
+                },
+                PackedElementField {
+                    name: "y".into(),
+                    offset: 4,
+                    r#type: foxglove::schemas::packed_element_field::NumericType::Float32.into(),
+                },
+                PackedElementField {
+                    name: "z".into(),
+                    offset: 8,
+                    r#type: foxglove::schemas::packed_element_field::NumericType::Float32.into(),
+                },
+            ],
+            data: pointcloud_storage.into(),
+            pose: None,
+        });
 
         let mut transforms = Vec::new();
         for (id, player) in asteroids.clients.iter() {
@@ -952,9 +1027,9 @@ const SHIP: &[u8] = include_bytes!("ship.glb");
 
 async fn handle_assets(_client: Client, path: String) -> Result<bytes::Bytes, String> {
     if path == "package://ship.glb" {
-        return Ok(SHIP.into());
+        Ok(SHIP.into())
     } else {
-        return Err(format!("{path} not found"));
+        Err(format!("{path} not found"))
     }
 }
 
